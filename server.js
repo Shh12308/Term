@@ -1,58 +1,38 @@
-const WebSocket = require('ws');
-const { spawn } = require('child_process');
+import express from "express";
+import cors from "cors";
+import { HfInference } from "@huggingface/inference";
+import dotenv from "dotenv";
+dotenv.config();
 
-// Configure WebSocket server
-const wss = new WebSocket.Server({ port: 8080 });
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-// List of allowed commands to prevent shell injection
-const allowedCommands = ['ls', 'pwd', 'echo', 'cat', 'uptime', 'whoami', 'date'];
+const hf = new HfInference(process.env.HF_API_KEY);
 
-wss.on('connection', (ws) => {
-    ws.send('Welcome to the secure Linux terminal! Type a command to begin...');
+app.post("/chat", async (req, res) => {
+  const prompt = req.body.prompt;
+  if (!prompt) return res.status(400).json({ error: "Missing prompt" });
 
-    ws.on('message', (message) => {
-        console.log(`Received: ${message}`);
-
-        // Sanitize input: check if the command is allowed
-        const commandArgs = message.split(' ');
-        const command = commandArgs[0];
-
-        if (allowedCommands.includes(command)) {
-            // Execute command safely
-            executeCommand(command, commandArgs.slice(1), ws);
-        } else {
-            // Return error for unallowed commands
-            ws.send('Error: Command not allowed.');
-        }
+  try {
+    const result = await hf.textGeneration({
+      model: "microsoft/phi-2",
+      inputs: prompt,
+      parameters: {
+        max_new_tokens: 300,
+        return_full_text: false
+      }
     });
-
-    // Timeout for execution (optional)
-    const timeout = setTimeout(() => {
-        ws.send('Error: Command execution timed out.');
-    }, 5000); // 5 seconds timeout
-
-    // Clean up timeout on completion
-    function executeCommand(command, args, ws) {
-        const cmdProcess = spawn(command, args);
-
-        let output = '';
-        cmdProcess.stdout.on('data', (data) => {
-            output += data;
-        });
-
-        cmdProcess.stderr.on('data', (data) => {
-            output += `stderr: ${data}`;
-        });
-
-        cmdProcess.on('close', (code) => {
-            clearTimeout(timeout); // Clear the timeout
-            if (code !== 0) {
-                ws.send(`Error: Command execution failed with code ${code}`);
-            } else {
-                ws.send(output);
-            }
-        });
-    }
+    res.json({ response: result.generated_text });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Inference failed" });
+  }
 });
 
-console.log('WebSocket server is listening on ws://localhost:8080');
+app.get("/", (req, res) => {
+  res.send("🧠 Phi-4 API is running");
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ Running on port ${PORT}`));
