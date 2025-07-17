@@ -1,0 +1,15 @@
+{
+  "name": "linux-terminal-server",
+  "version": "1.0.0",
+  "description": "A WebSocket server that simulates a Linux terminal.",
+  "main": "terminal-server.js",
+  "scripts": {
+    "start": "node terminal-server.js"
+  },
+  "dependencies": {
+    "ws": "^8.7.0"
+  },
+  "devDependencies": {},
+  "author": "",
+  "license": "ISC"
+}
