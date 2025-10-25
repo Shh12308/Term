@@ -12,7 +12,7 @@
     "node": "20.x"
   },
   "dependencies": {
-    "agora-access-token": "^3.4.0",
+    "agora-access-token": "^2.0.4",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
