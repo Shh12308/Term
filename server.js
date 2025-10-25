@@ -8,7 +8,8 @@ import jwt from "jsonwebtoken";
 import cors from "cors";
 import http from "http";
 import { Server as SocketIOServer } from "socket.io";
-import { RtcTokenBuilder, RtcRole, RtmTokenBuilder } from "agora-access-token";
+import agora from "agora-access-token";
+const { RtcTokenBuilder, RtcRole, RtmTokenBuilder } = agora;
 
 import { Strategy as GoogleStrategy } from "passport-google-oauth20";
 import { Strategy as DiscordStrategy } from "passport-discord";
