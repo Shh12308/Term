@@ -1,5 +1,0 @@
-fastapi
-uvicorn
-transformers
-torch
-typing-extensions>=4.0
