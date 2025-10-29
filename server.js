@@ -1,4 +1,4 @@
-// server.js - OmeVo backend (OAuth, matchmaking queue, Agora token gen, Socket.IO)
+// server.js - MonkeyApp backend (OAuth + matchmaking + AI + Agora)
 import express from "express";
 import pg from "pg";
 import dotenv from "dotenv";
@@ -10,10 +10,11 @@ import http from "http";
 import { Server as SocketIOServer } from "socket.io";
 import agora from "agora-access-token";
 const { RtcTokenBuilder, RtcRole, RtmTokenBuilder } = agora;
-
 import { Strategy as GoogleStrategy } from "passport-google-oauth20";
 import { Strategy as DiscordStrategy } from "passport-discord";
 import { Strategy as FacebookStrategy } from "passport-facebook";
+import OpenAI from "openai";
+import crypto from "crypto";
 
 dotenv.config();
 
@@ -55,7 +56,7 @@ passport.deserializeUser(async (id, done) => {
   }
 });
 
-// --- Passport strategies (Google, Discord, Facebook) ---
+// --- Passport strategies ---
 passport.use(
   new GoogleStrategy(
     {
@@ -65,9 +66,8 @@ passport.use(
     },
     async (accessToken, refreshToken, profile, done) => {
       try {
-        const email = profile.emails && profile.emails[0] && profile.emails[0].value;
+        const email = profile.emails?.[0]?.value;
         const providerId = profile.id;
-        // upsert user
         const text = `
           INSERT INTO users (username, email, provider, provider_id, created_at, updated_at)
           VALUES ($1,$2,'google',$3,NOW(),NOW())
@@ -120,7 +120,7 @@ passport.use(
     },
     async (accessToken, refreshToken, profile, done) => {
       try {
-        const email = (profile.emails && profile.emails[0] && profile.emails[0].value) || null;
+        const email = profile.emails?.[0]?.value || null;
         const providerId = profile.id;
         const text = `
           INSERT INTO users (username, email, provider, provider_id, created_at, updated_at)
@@ -144,20 +144,16 @@ function signJwtForUser(user) {
 }
 
 // --- OAuth Routes ---
-// Kick off Google OAuth
 app.get("/auth/google", passport.authenticate("google", { scope: ["profile", "email"] }));
 app.get(
   "/auth/google/callback",
   passport.authenticate("google", { failureRedirect: "/auth/failure", session: true }),
   (req, res) => {
-    // issue JWT and return to frontend (redirect or show token)
     const token = signJwtForUser(req.user);
-    // Redirect to frontend with token (frontend should parse token and store)
     res.redirect(`${process.env.FRONTEND_URL || "/"}?token=${token}`);
   }
 );
 
-// Discord
 app.get("/auth/discord", passport.authenticate("discord"));
 app.get(
   "/auth/discord/callback",
@@ -168,7 +164,6 @@ app.get(
   }
 );
 
-// Facebook
 app.get("/auth/facebook", passport.authenticate("facebook", { scope: ["email"] }));
 app.get(
   "/auth/facebook/callback",
@@ -179,18 +174,15 @@ app.get(
   }
 );
 
-app.get("/auth/failure", (req, res) => {
-  res.status(401).json({ error: "Authentication failed" });
-});
+app.get("/auth/failure", (req, res) => res.status(401).json({ error: "Authentication failed" }));
 
-// --- Protected middleware to check JWT ---
+// --- Protected middleware ---
 async function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization || req.body.token || req.query.token;
   if (!authHeader) return res.status(401).json({ error: "Missing token" });
   const token = authHeader.replace(/^Bearer\s*/i, "");
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    // attach user record
     const { rows } = await pool.query("SELECT * FROM users WHERE id=$1", [decoded.id]);
     if (!rows[0]) return res.status(401).json({ error: "User not found" });
     req.user = rows[0];
@@ -200,27 +192,19 @@ async function requireAuth(req, res, next) {
   }
 }
 
-// --- Socket.IO for realtime notifications (match found etc) ---
+// --- Socket.IO setup ---
 const server = http.createServer(app);
-const io = new SocketIOServer(server, {
-  cors: { origin: "*" }
-});
-
-const SOCKET_AUTH_NAMESPACE = "/"; // single namespace
-
-// map userId -> socket id
+const io = new SocketIOServer(server, { cors: { origin: "*" } });
 const onlineSockets = new Map();
 
 io.on("connection", (socket) => {
-  // client must emit 'auth' with their JWT immediately
   socket.on("auth", async ({ token }) => {
     try {
       const decoded = jwt.verify(token, JWT_SECRET);
       onlineSockets.set(String(decoded.id), socket.id);
       socket.data.userId = String(decoded.id);
       console.log("Socket auth success for user:", decoded.id);
-    } catch (err) {
-      console.warn("Socket auth failed");
+    } catch {
       socket.disconnect(true);
     }
   });
@@ -231,8 +215,98 @@ io.on("connection", (socket) => {
   });
 });
 
-// --- Matchmaking API ---
-// Enqueue user (with preferences)
+// --- OpenAI setup ---
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// --- AES Encryption helpers ---
+const ENCRYPTION_SECRET = process.env.ENCRYPTION_SECRET || "32_characters_minimum!";
+function encrypt(text) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", Buffer.from(ENCRYPTION_SECRET), iv);
+  const enc = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, enc]).toString("base64");
+}
+function decrypt(encData) {
+  const raw = Buffer.from(encData, "base64");
+  const iv = raw.slice(0, 12);
+  const tag = raw.slice(12, 28);
+  const text = raw.slice(28);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", Buffer.from(ENCRYPTION_SECRET), iv);
+  decipher.setAuthTag(tag);
+  return decipher.update(text, "binary", "utf8") + decipher.final("utf8");
+}
+
+// --- Matchmaking queue helpers ---
+async function tryFindMatch(userId, genderPref, locationPref, interests = []) {
+  const candidateQuery = `
+    SELECT q.user_id, q.gender, q.location, q.nickname, q.interests
+    FROM queue q
+    WHERE q.user_id <> $1
+      AND ($2 = 'any' OR q.gender = $2)
+      AND ($3 = 'any' OR q.location = $3)
+    ORDER BY q.joined_at ASC
+    LIMIT 5
+  `;
+  const { rows } = await pool.query(candidateQuery, [userId, genderPref, locationPref]);
+  if (!rows.length) return null;
+
+  // find first candidate sharing at least one interest
+  let matched = null;
+  for (const r of rows) {
+    const candidateInterests = (r.interests || "").split(",").map(s => s.trim().toLowerCase());
+    if (!interests.length || interests.some(i => candidateInterests.includes(i.toLowerCase()))) {
+      matched = r;
+      break;
+    }
+  }
+  if (!matched) return null;
+
+  const peerId = matched.user_id;
+  const channelNameRaw = `monkeyapp_${Math.min(userId, peerId)}_${Math.max(userId, peerId)}_${Date.now()}`;
+  const channelNameEncrypted = encrypt(channelNameRaw);
+
+  // save match record
+  await pool.query(
+    `INSERT INTO matches (user_a, user_b, channel_name, created_at) VALUES ($1,$2,$3,NOW())`,
+    [userId, peerId, channelNameEncrypted]
+  );
+
+  // remove both from queue
+  await pool.query("DELETE FROM queue WHERE user_id IN ($1,$2)", [userId, peerId]).catch(() => {});
+
+  // notify peer if online via socket.io
+  const peerSocketId = onlineSockets.get(String(peerId));
+  if (peerSocketId) {
+    io.to(peerSocketId).emit("match_found", { peerId: userId, channel: channelNameEncrypted });
+  }
+  const requesterSocketId = onlineSockets.get(String(userId));
+  if (requesterSocketId) {
+    io.to(requesterSocketId).emit("match_found", { peerId: peerId, channel: channelNameEncrypted });
+  }
+
+  // Generate icebreaker using OpenAI
+  const prompt = `
+    Suggest a friendly, short icebreaker for two users.
+    User A interests: ${interests.join(", ")}
+    User B interests: ${matched.interests || ""}
+  `;
+  let icebreaker = "Hey, nice to meet you!";
+  try {
+    const res = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 40,
+    });
+    icebreaker = res.choices[0].message.content.trim();
+  } catch (e) {
+    console.warn("OpenAI icebreaker failed", e);
+  }
+
+  return { peerId, channel: channelNameEncrypted, icebreaker };
+}
+
+// --- Queue endpoints ---
 app.post("/queue/enqueue", requireAuth, async (req, res) => {
   try {
     const { gender = "any", location = "any", interests = "", nickname = "" } = req.body;
@@ -245,12 +319,11 @@ app.post("/queue/enqueue", requireAuth, async (req, res) => {
       [userId, gender, location, interests, nickname]
     );
 
-    // try immediate match
-    const match = await tryFindMatch(userId, gender, location);
+    const interestsArr = interests.split(",").map(i => i.trim().toLowerCase());
+    const match = await tryFindMatch(userId, gender, location, interestsArr);
     if (match) {
-      return res.json({ matched: true, peerId: match.peerId, channel: match.channel });
+      return res.json({ matched: true, peerId: match.peerId, channel: match.channel, icebreaker: match.icebreaker });
     }
-
     return res.json({ matched: false });
   } catch (err) {
     console.error("enqueue error:", err);
@@ -258,7 +331,6 @@ app.post("/queue/enqueue", requireAuth, async (req, res) => {
   }
 });
 
-// Dequeue / remove from queue
 app.post("/queue/leave", requireAuth, async (req, res) => {
   try {
     await pool.query("DELETE FROM queue WHERE user_id=$1", [String(req.user.id)]);
@@ -269,79 +341,7 @@ app.post("/queue/leave", requireAuth, async (req, res) => {
   }
 });
 
-// Get current queue (admin)
-app.get("/queue", requireAuth, async (req, res) => {
-  try {
-    // only allow admins to inspect
-    if (req.user.role !== "admin") return res.status(403).json({ error: "forbidden" });
-    const { rows } = await pool.query("SELECT * FROM queue ORDER BY joined_at ASC");
-    res.json(rows);
-  } catch (err) {
-    res.status(500).json({ error: "failed" });
-  }
-});
-
-// tryFindMatch function - will look for a candidate in queue matching preferences
-async function tryFindMatch(userId, genderPref, locationPref) {
-  // simple matching: look for anyone in queue (excluding self) where their gender/loc match preferences (or 'any')
-  // and where this user's preferences also match the candidate (mutual). For simplicity we match if candidate matches requester conditions.
-  const candidateQuery = `
-    SELECT q.user_id, q.gender, q.location, q.nickname
-    FROM queue q
-    WHERE q.user_id <> $1
-      AND ($2 = 'any' OR q.gender = $2)
-      AND ($3 = 'any' OR q.location = $3)
-    ORDER BY q.joined_at ASC
-    LIMIT 1
-  `;
-  const { rows } = await pool.query(candidateQuery, [userId, genderPref, locationPref]);
-  if (!rows.length) return null;
-
-  const peerId = rows[0].user_id;
-  // create channel name deterministically
-  const channelName = `omevo_${Math.min(Number(userId), Number(peerId))}_${Math.max(Number(userId), Number(peerId))}_${Date.now()}`;
-
-  // save match record
-  await pool.query(
-    `INSERT INTO matches (user_a, user_b, channel_name, created_at) VALUES ($1,$2,$3,NOW())`,
-    [userId, peerId, channelName]
-  );
-
-  // remove both from queue
-  await pool.query("DELETE FROM queue WHERE user_id IN ($1, $2)", [userId, peerId]).catch(() => {});
-
-  // notify peer if online via socket.io
-  const peerSocketId = onlineSockets.get(String(peerId));
-  if (peerSocketId) {
-    io.to(peerSocketId).emit("match_found", { peerId: userId, channel: channelName });
-  }
-  // also notify requester if online (but in typical flow client calls enqueue and will get HTTP response)
-  const requesterSocketId = onlineSockets.get(String(userId));
-  if (requesterSocketId) {
-    io.to(requesterSocketId).emit("match_found", { peerId: peerId, channel: channelName });
-  }
-
-  return { peerId, channel: channelName };
-}
-
-// Endpoint to manually attempt matching (client fallback)
-app.post("/match/try", requireAuth, async (req, res) => {
-  try {
-    const userId = String(req.user.id);
-    const q = await pool.query("SELECT gender, location FROM queue WHERE user_id=$1", [userId]);
-    if (!q.rows.length) return res.status(400).json({ error: "not in queue" });
-    const { gender, location } = q.rows[0];
-    const match = await tryFindMatch(userId, gender, location);
-    if (match) return res.json({ matched: true, peerId: match.peerId, channel: match.channel });
-    return res.json({ matched: false });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "match failed" });
-  }
-});
-
-// --- Agora token generation endpoint ---
-// Requires AGORA_APP_ID, AGORA_APP_CERTIFICATE env vars
+// --- Generate Agora RTC / RTM tokens ---
 app.post("/generateToken", requireAuth, async (req, res) => {
   try {
     const { channelName, uid: requestedUid, role = "publisher", expirySeconds = 3600 } = req.body;
@@ -351,16 +351,12 @@ app.post("/generateToken", requireAuth, async (req, res) => {
     const appCertificate = process.env.AGORA_APP_CERTIFICATE;
     if (!appID || !appCertificate) return res.status(500).json({ error: "Agora credentials not configured" });
 
-    // Agora uid can be 0 (string) or numeric. We'll use the user's id as uid if requested, else 0.
     const uid = requestedUid !== undefined ? String(requestedUid) : String(req.user.id);
-
-    // role mapping
     const rtcRole = role === "publisher" ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER;
 
-    const currentTimestamp = Math.floor(Date.now() / 1000);
-    const privilegeExpiredTs = currentTimestamp + Number(expirySeconds);
+    const currentTs = Math.floor(Date.now() / 1000);
+    const privilegeExpiredTs = currentTs + Number(expirySeconds);
 
-    // Build RTC token (for media)
     const rtcToken = RtcTokenBuilder.buildTokenWithAccount(
       appID,
       appCertificate,
@@ -370,13 +366,7 @@ app.post("/generateToken", requireAuth, async (req, res) => {
       privilegeExpiredTs
     );
 
-    // Build RTM token (for messaging if needed)
-    const rtmToken = RtmTokenBuilder.buildToken(
-      appID,
-      appCertificate,
-      uid,
-      privilegeExpiredTs
-    );
+    const rtmToken = RtmTokenBuilder.buildToken(appID, appCertificate, uid, privilegeExpiredTs);
 
     return res.json({ rtcToken, rtmToken, appID, uid });
   } catch (err) {
@@ -388,15 +378,9 @@ app.post("/generateToken", requireAuth, async (req, res) => {
 // --- Basic health check ---
 app.get("/health", (req, res) => res.json({ ok: true, env: process.env.NODE_ENV || "dev" }));
 
-// --- Sign-in by email/password (optional) ---
-app.post("/auth/local/signup", async (req, res) => {
-  // For phone/email + password you can implement here. This example focuses on OAuth.
-  res.status(501).json({ error: "Not implemented - use OAuth via Google/Discord/Facebook" });
-});
-
 // --- Start the server ---
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
-  console.log(`OmeVo backend listening on port ${PORT}`);
-  console.log("Make sure environment variables are set (AGORA_APP_ID, AGORA_APP_CERTIFICATE, DB_*, GOOGLE_* etc.)");
+  console.log(`MonkeyApp backend listening on port ${PORT}`);
+  console.log("Ensure env vars: AGORA_APP_ID, AGORA_APP_CERTIFICATE, DB_*, GOOGLE_*, DISCORD_*, FACEBOOK_*, OPENAI_API_KEY, ENCRYPTION_SECRET");
 });
