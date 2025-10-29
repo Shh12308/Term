@@ -347,20 +347,57 @@ app.post("/generateToken", requireAuth, async (req, res) => {
 });
 
 // ------------------- BAN PAYMENT -------------------
-app.post("/pay/unban", requireAuth, async (req, res) => {
+app.post("/api/pay-unban", async (req, res) => {
   try {
-    const userId = req.user.id;
-    const paymentIntent = await STRIPE.paymentIntents.create({
-      amount: Math.round(UNBAN_PRICE * 100),
-      currency: "usd",
-      metadata: { userId },
-      description: `Unban for user ${userId}`,
+    const { userId } = req.body;
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ["card"],
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            product_data: {
+              name: "Ban Removal",
+              description: "Remove your account suspension",
+            },
+            unit_amount: 599, // $5.99
+          },
+          quantity: 1,
+        },
+      ],
+      mode: "payment",
+      success_url: `${process.env.FRONTEND_URL}/unban-success?userId=${userId}`,
+      cancel_url: `${process.env.FRONTEND_URL}/unban-cancel`,
     });
-    return res.json({ clientSecret: paymentIntent.client_secret });
-  } catch (err) {
-    console.error("Stripe payment error:", err);
+    res.json({ url: session.url });
+  } catch (error) {
+    console.error("Stripe error:", error);
     res.status(500).json({ error: "Payment failed" });
   }
+});
+
+// Stripe webhook — to confirm payment
+app.post("/api/stripe-webhook", express.raw({ type: "application/json" }), (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error("Webhook signature verification failed:", err);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // Handle payment success event
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object;
+    const userId = new URL(session.success_url).searchParams.get("userId");
+
+    // TODO: unban the user in your DB
+    console.log(`✅ Unbanned user: ${userId}`);
+  }
+
+  res.status(200).json({ received: true });
 });
 
 // ------------------- HEALTH CHECK -------------------
