@@ -1,4 +1,4 @@
-// server.js - MonkeyApp backend (OAuth + matchmaking + AI + Agora)
+// server.js - Complete backend for OmeVo/Monkey-style app
 import express from "express";
 import pg from "pg";
 import dotenv from "dotenv";
@@ -10,19 +10,23 @@ import http from "http";
 import { Server as SocketIOServer } from "socket.io";
 import agora from "agora-access-token";
 const { RtcTokenBuilder, RtcRole, RtmTokenBuilder } = agora;
+
 import { Strategy as GoogleStrategy } from "passport-google-oauth20";
 import { Strategy as DiscordStrategy } from "passport-discord";
 import { Strategy as FacebookStrategy } from "passport-facebook";
+
+import Stripe from "stripe";
 import OpenAI from "openai";
-import crypto from "crypto";
 
 dotenv.config();
 
+// ------------------- CONFIG -------------------
 const app = express();
 app.use(cors({ origin: true }));
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "5mb" })); // for messages + frames
+const server = http.createServer(app);
+const io = new SocketIOServer(server, { cors: { origin: "*" } });
 
-// --- Postgres Pool ---
 const pool = new pg.Pool({
   user: process.env.DB_USER,
   host: process.env.DB_HOST,
@@ -31,10 +35,17 @@ const pool = new pg.Pool({
   port: process.env.DB_PORT,
 });
 
-// --- JWT secret ---
 const JWT_SECRET = process.env.JWT_SECRET || "super_secret_jwt_key";
+const STRIPE = new Stripe(process.env.STRIPE_SECRET_KEY || "");
+const OPENAI = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || "" });
 
-// --- Session (passport requires it for OAuth flows) ---
+const AGORA_APP_ID = process.env.AGORA_APP_ID;
+const AGORA_APP_CERT = process.env.AGORA_APP_CERTIFICATE;
+
+const BAN_HOURS = 750;
+const UNBAN_PRICE = 5.99;
+
+// ------------------- SESSION & PASSPORT -------------------
 app.use(
   session({
     secret: process.env.SESSION_SECRET || "session_secret_omevo",
@@ -45,7 +56,6 @@ app.use(
 app.use(passport.initialize());
 app.use(passport.session());
 
-// --- Passport user serialization ---
 passport.serializeUser((user, done) => done(null, user.id));
 passport.deserializeUser(async (id, done) => {
   try {
@@ -56,7 +66,8 @@ passport.deserializeUser(async (id, done) => {
   }
 });
 
-// --- Passport strategies ---
+// ------------------- PASSPORT STRATEGIES -------------------
+// Google, Discord, Facebook - upsert user if exists
 passport.use(
   new GoogleStrategy(
     {
@@ -137,46 +148,12 @@ passport.use(
   )
 );
 
-// --- Helper: sign JWT ---
+// ------------------- JWT HELPER -------------------
 function signJwtForUser(user) {
   const payload = { id: user.id, email: user.email, provider: user.provider };
   return jwt.sign(payload, JWT_SECRET, { expiresIn: "14d" });
 }
 
-// --- OAuth Routes ---
-app.get("/auth/google", passport.authenticate("google", { scope: ["profile", "email"] }));
-app.get(
-  "/auth/google/callback",
-  passport.authenticate("google", { failureRedirect: "/auth/failure", session: true }),
-  (req, res) => {
-    const token = signJwtForUser(req.user);
-    res.redirect(`${process.env.FRONTEND_URL || "/"}?token=${token}`);
-  }
-);
-
-app.get("/auth/discord", passport.authenticate("discord"));
-app.get(
-  "/auth/discord/callback",
-  passport.authenticate("discord", { failureRedirect: "/auth/failure", session: true }),
-  (req, res) => {
-    const token = signJwtForUser(req.user);
-    res.redirect(`${process.env.FRONTEND_URL || "/"}?token=${token}`);
-  }
-);
-
-app.get("/auth/facebook", passport.authenticate("facebook", { scope: ["email"] }));
-app.get(
-  "/auth/facebook/callback",
-  passport.authenticate("facebook", { failureRedirect: "/auth/failure", session: true }),
-  (req, res) => {
-    const token = signJwtForUser(req.user);
-    res.redirect(`${process.env.FRONTEND_URL || "/"}?token=${token}`);
-  }
-);
-
-app.get("/auth/failure", (req, res) => res.status(401).json({ error: "Authentication failed" }));
-
-// --- Protected middleware ---
 async function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization || req.body.token || req.query.token;
   if (!authHeader) return res.status(401).json({ error: "Missing token" });
@@ -192,9 +169,28 @@ async function requireAuth(req, res, next) {
   }
 }
 
-// --- Socket.IO setup ---
-const server = http.createServer(app);
-const io = new SocketIOServer(server, { cors: { origin: "*" } });
+// ------------------- OAuth ROUTES -------------------
+app.get("/auth/google", passport.authenticate("google", { scope: ["profile", "email"] }));
+app.get("/auth/google/callback", passport.authenticate("google", { failureRedirect: "/auth/failure", session: true }), (req, res) => {
+  const token = signJwtForUser(req.user);
+  res.redirect(`${process.env.FRONTEND_URL || "/"}?token=${token}`);
+});
+
+app.get("/auth/discord", passport.authenticate("discord"));
+app.get("/auth/discord/callback", passport.authenticate("discord", { failureRedirect: "/auth/failure", session: true }), (req, res) => {
+  const token = signJwtForUser(req.user);
+  res.redirect(`${process.env.FRONTEND_URL || "/"}?token=${token}`);
+});
+
+app.get("/auth/facebook", passport.authenticate("facebook", { scope: ["email"] }));
+app.get("/auth/facebook/callback", passport.authenticate("facebook", { failureRedirect: "/auth/failure", session: true }), (req, res) => {
+  const token = signJwtForUser(req.user);
+  res.redirect(`${process.env.FRONTEND_URL || "/"}?token=${token}`);
+});
+
+app.get("/auth/failure", (req, res) => res.status(401).json({ error: "Authentication failed" }));
+
+// ------------------- SOCKET.IO -------------------
 const onlineSockets = new Map();
 
 io.on("connection", (socket) => {
@@ -204,7 +200,7 @@ io.on("connection", (socket) => {
       onlineSockets.set(String(decoded.id), socket.id);
       socket.data.userId = String(decoded.id);
       console.log("Socket auth success for user:", decoded.id);
-    } catch {
+    } catch (err) {
       socket.disconnect(true);
     }
   });
@@ -213,100 +209,82 @@ io.on("connection", (socket) => {
     const uid = socket.data.userId;
     if (uid) onlineSockets.delete(String(uid));
   });
+
+  // ------------------- AUTOMATED MODERATION -------------------
+  socket.on("chat_message", async ({ message }) => {
+    const uid = socket.data.userId;
+    if (!uid) return;
+    try {
+      const mod = await OPENAI.moderations.create({ model: "omni-moderation-latest", input: message });
+      const flagged = mod.results?.[0]?.categories?.sexual || mod.results?.[0]?.flagged;
+      if (flagged) {
+        // Ban user 750 hours
+        await pool.query("UPDATE users SET banned_until = NOW() + INTERVAL '750 hours' WHERE id=$1", [uid]);
+        // Notify client and disconnect
+        socket.emit("moderation_action", { type: "chat", message, banned: true, duration_hours: BAN_HOURS });
+        socket.disconnect(true);
+      } else {
+        // Forward message to peers if allowed
+        io.emit("chat_message", { uid, message });
+      }
+    } catch (err) {
+      console.error("Moderation error:", err);
+    }
+  });
+
+  socket.on("video_frame", async ({ frameBase64 }) => {
+    const uid = socket.data.userId;
+    if (!uid) return;
+    try {
+      const mod = await OPENAI.moderations.create({ model: "omni-moderation-latest", input: frameBase64 });
+      const flagged = mod.results?.[0]?.categories?.sexual || mod.results?.[0]?.flagged;
+      if (flagged) {
+        await pool.query("UPDATE users SET banned_until = NOW() + INTERVAL '750 hours' WHERE id=$1", [uid]);
+        socket.emit("moderation_action", { type: "video", banned: true, duration_hours: BAN_HOURS });
+        socket.disconnect(true);
+      }
+    } catch (err) {
+      console.error("Video moderation error:", err);
+    }
+  });
 });
 
-// --- OpenAI setup ---
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-// --- AES Encryption helpers ---
-const ENCRYPTION_SECRET = process.env.ENCRYPTION_SECRET || "32_characters_minimum!";
-function encrypt(text) {
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv("aes-256-gcm", Buffer.from(ENCRYPTION_SECRET), iv);
-  const enc = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return Buffer.concat([iv, tag, enc]).toString("base64");
-}
-function decrypt(encData) {
-  const raw = Buffer.from(encData, "base64");
-  const iv = raw.slice(0, 12);
-  const tag = raw.slice(12, 28);
-  const text = raw.slice(28);
-  const decipher = crypto.createDecipheriv("aes-256-gcm", Buffer.from(ENCRYPTION_SECRET), iv);
-  decipher.setAuthTag(tag);
-  return decipher.update(text, "binary", "utf8") + decipher.final("utf8");
-}
-
-// --- Matchmaking queue helpers ---
-async function tryFindMatch(userId, genderPref, locationPref, interests = []) {
+// ------------------- MATCHMAKING -------------------
+async function tryFindMatch(userId, genderPref, locationPref) {
   const candidateQuery = `
-    SELECT q.user_id, q.gender, q.location, q.nickname, q.interests
+    SELECT q.user_id, q.gender, q.location
     FROM queue q
     WHERE q.user_id <> $1
-      AND ($2 = 'any' OR q.gender = $2)
-      AND ($3 = 'any' OR q.location = $3)
-    ORDER BY q.joined_at ASC
-    LIMIT 5
-  `;
+      AND ($2='any' OR q.gender=$2)
+      AND ($3='any' OR q.location=$3)
+    ORDER BY joined_at ASC LIMIT 1`;
   const { rows } = await pool.query(candidateQuery, [userId, genderPref, locationPref]);
-  if (!rows.length) return null;
+   if (!rows.length) return null;
 
-  // find first candidate sharing at least one interest
-  let matched = null;
-  for (const r of rows) {
-    const candidateInterests = (r.interests || "").split(",").map(s => s.trim().toLowerCase());
-    if (!interests.length || interests.some(i => candidateInterests.includes(i.toLowerCase()))) {
-      matched = r;
-      break;
-    }
-  }
-  if (!matched) return null;
-
-  const peerId = matched.user_id;
-  const channelNameRaw = `monkeyapp_${Math.min(userId, peerId)}_${Math.max(userId, peerId)}_${Date.now()}`;
-  const channelNameEncrypted = encrypt(channelNameRaw);
+  const peerId = rows[0].user_id;
+  const channelName = `omevo_${Math.min(Number(userId), Number(peerId))}_${Math.max(Number(userId), Number(peerId))}_${Date.now()}`;
 
   // save match record
   await pool.query(
     `INSERT INTO matches (user_a, user_b, channel_name, created_at) VALUES ($1,$2,$3,NOW())`,
-    [userId, peerId, channelNameEncrypted]
+    [userId, peerId, channelName]
   );
 
   // remove both from queue
   await pool.query("DELETE FROM queue WHERE user_id IN ($1,$2)", [userId, peerId]).catch(() => {});
 
-  // notify peer if online via socket.io
+  // notify peer if online
   const peerSocketId = onlineSockets.get(String(peerId));
-  if (peerSocketId) {
-    io.to(peerSocketId).emit("match_found", { peerId: userId, channel: channelNameEncrypted });
-  }
+  if (peerSocketId) io.to(peerSocketId).emit("match_found", { peerId: userId, channel: channelName });
+
+  // notify requester
   const requesterSocketId = onlineSockets.get(String(userId));
-  if (requesterSocketId) {
-    io.to(requesterSocketId).emit("match_found", { peerId: peerId, channel: channelNameEncrypted });
-  }
+  if (requesterSocketId) io.to(requesterSocketId).emit("match_found", { peerId, channel: channelName });
 
-  // Generate icebreaker using OpenAI
-  const prompt = `
-    Suggest a friendly, short icebreaker for two users.
-    User A interests: ${interests.join(", ")}
-    User B interests: ${matched.interests || ""}
-  `;
-  let icebreaker = "Hey, nice to meet you!";
-  try {
-    const res = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: 40,
-    });
-    icebreaker = res.choices[0].message.content.trim();
-  } catch (e) {
-    console.warn("OpenAI icebreaker failed", e);
-  }
-
-  return { peerId, channel: channelNameEncrypted, icebreaker };
+  return { peerId, channel: channelName };
 }
 
-// --- Queue endpoints ---
+// ------------------- QUEUE ENDPOINTS -------------------
 app.post("/queue/enqueue", requireAuth, async (req, res) => {
   try {
     const { gender = "any", location = "any", interests = "", nickname = "" } = req.body;
@@ -319,11 +297,9 @@ app.post("/queue/enqueue", requireAuth, async (req, res) => {
       [userId, gender, location, interests, nickname]
     );
 
-    const interestsArr = interests.split(",").map(i => i.trim().toLowerCase());
-    const match = await tryFindMatch(userId, gender, location, interestsArr);
-    if (match) {
-      return res.json({ matched: true, peerId: match.peerId, channel: match.channel, icebreaker: match.icebreaker });
-    }
+    const match = await tryFindMatch(userId, gender, location);
+    if (match) return res.json({ matched: true, peerId: match.peerId, channel: match.channel });
+
     return res.json({ matched: false });
   } catch (err) {
     console.error("enqueue error:", err);
@@ -341,46 +317,57 @@ app.post("/queue/leave", requireAuth, async (req, res) => {
   }
 });
 
-// --- Generate Agora RTC / RTM tokens ---
+// ------------------- AGORA TOKEN GENERATION -------------------
 app.post("/generateToken", requireAuth, async (req, res) => {
   try {
     const { channelName, uid: requestedUid, role = "publisher", expirySeconds = 3600 } = req.body;
     if (!channelName) return res.status(400).json({ error: "channelName required" });
 
-    const appID = process.env.AGORA_APP_ID;
-    const appCertificate = process.env.AGORA_APP_CERTIFICATE;
-    if (!appID || !appCertificate) return res.status(500).json({ error: "Agora credentials not configured" });
-
     const uid = requestedUid !== undefined ? String(requestedUid) : String(req.user.id);
     const rtcRole = role === "publisher" ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER;
 
-    const currentTs = Math.floor(Date.now() / 1000);
-    const privilegeExpiredTs = currentTs + Number(expirySeconds);
+    const currentTimestamp = Math.floor(Date.now() / 1000);
+    const privilegeExpiredTs = currentTimestamp + Number(expirySeconds);
 
     const rtcToken = RtcTokenBuilder.buildTokenWithAccount(
-      appID,
-      appCertificate,
+      AGORA_APP_ID,
+      AGORA_APP_CERT,
       channelName,
       uid,
       rtcRole,
       privilegeExpiredTs
     );
+    const rtmToken = RtmTokenBuilder.buildToken(AGORA_APP_ID, AGORA_APP_CERT, uid, privilegeExpiredTs);
 
-    const rtmToken = RtmTokenBuilder.buildToken(appID, appCertificate, uid, privilegeExpiredTs);
-
-    return res.json({ rtcToken, rtmToken, appID, uid });
+    return res.json({ rtcToken, rtmToken, appID: AGORA_APP_ID, uid });
   } catch (err) {
     console.error("generateToken error", err);
     res.status(500).json({ error: "token generation failed" });
   }
 });
 
-// --- Basic health check ---
+// ------------------- BAN PAYMENT -------------------
+app.post("/pay/unban", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const paymentIntent = await STRIPE.paymentIntents.create({
+      amount: Math.round(UNBAN_PRICE * 100),
+      currency: "usd",
+      metadata: { userId },
+      description: `Unban for user ${userId}`,
+    });
+    return res.json({ clientSecret: paymentIntent.client_secret });
+  } catch (err) {
+    console.error("Stripe payment error:", err);
+    res.status(500).json({ error: "Payment failed" });
+  }
+});
+
+// ------------------- HEALTH CHECK -------------------
 app.get("/health", (req, res) => res.json({ ok: true, env: process.env.NODE_ENV || "dev" }));
 
-// --- Start the server ---
+// ------------------- START SERVER -------------------
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
-  console.log(`MonkeyApp backend listening on port ${PORT}`);
-  console.log("Ensure env vars: AGORA_APP_ID, AGORA_APP_CERTIFICATE, DB_*, GOOGLE_*, DISCORD_*, FACEBOOK_*, OPENAI_API_KEY, ENCRYPTION_SECRET");
+  console.log(`Server running on port ${PORT}`);
 });
