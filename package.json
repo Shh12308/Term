@@ -1,7 +1,7 @@
 {
   "name": "omevo-backend",
   "version": "1.0.0",
-  "description": "OmeVo backend (OAuth, matchmaking, Socket.IO, Agora)",
+  "description": "OmeVo backend (OAuth, matchmaking, Socket.IO, Agora, OpenAI moderation, Stripe payments)",
   "main": "server.js",
   "type": "module",
   "scripts": {
@@ -23,12 +23,26 @@
     "passport-facebook": "^3.0.0",
     "passport-google-oauth20": "^2.0.0",
     "pg": "^8.12.0",
-    "socket.io": "^4.7.2"
+    "socket.io": "^4.7.2",
+    "stripe": "^14.12.0",
+    "openai": "^4.61.0",
+    "multer": "^1.4.5-lts.1",
+    "node-fetch": "^3.3.2"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
   },
-  "keywords": ["express", "oauth", "socket.io", "agora", "postgres", "matchmaking"],
+  "keywords": [
+    "express",
+    "oauth",
+    "socket.io",
+    "agora",
+    "postgres",
+    "matchmaking",
+    "moderation",
+    "stripe",
+    "openai"
+  ],
   "author": "GoldBoy",
   "license": "MIT"
 }
