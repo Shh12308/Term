@@ -284,16 +284,58 @@ async function tryFindMatch(userId, genderPref, locationPref) {
   return { peerId, channel: channelName };
 }
 
-// ------------------- QUEUE ENDPOINTS -------------------
+// ------------------- USER PREFERENCES -------------------
+app.get("/api/user/preferences", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { rows } = await pool.query(
+      "SELECT gender, location FROM users WHERE id = $1",
+      [userId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error("Fetch preferences failed:", err);
+    res.status(500).json({ error: "Could not fetch preferences" });
+  }
+});
+
+app.post("/api/user/preferences", requireAuth, async (req, res) => {
+  try {
+    const { gender, location } = req.body;
+    await pool.query(
+      "UPDATE users SET gender=$1, location=$2, updated_at=NOW() WHERE id=$3",
+      [gender || "any", location || "any", req.user.id]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Save preferences failed:", err);
+    res.status(500).json({ error: "Could not save preferences" });
+  }
+});
+
+import geoip from "geoip-lite";
+
 app.post("/queue/enqueue", requireAuth, async (req, res) => {
   try {
-    const { gender = "any", location = "any", interests = "", nickname = "" } = req.body;
+    let { gender="any", location="any", interests="", nickname="" } = req.body;
     const userId = String(req.user.id);
+
+    // If no explicit location provided, infer from IP
+    if (location === "any") {
+      const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress;
+      const geo = geoip.lookup(ip);
+      if (geo && geo.country) {
+        location = geo.country.toLowerCase();  // e.g., "us", "ca"
+      }
+    }
 
     await pool.query(
       `INSERT INTO queue (user_id, gender, location, interests, nickname, joined_at)
        VALUES ($1,$2,$3,$4,$5,NOW())
-       ON CONFLICT (user_id) DO UPDATE SET gender=EXCLUDED.gender, location=EXCLUDED.location, interests=EXCLUDED.interests, nickname=EXCLUDED.nickname, joined_at=NOW()`,
+       ON CONFLICT (user_id) DO UPDATE SET gender=EXCLUDED.gender,
+         location=EXCLUDED.location, interests=EXCLUDED.interests,
+         nickname=EXCLUDED.nickname, joined_at=NOW()`,
       [userId, gender, location, interests, nickname]
     );
 
