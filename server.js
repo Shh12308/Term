@@ -5,7 +5,7 @@ import geoip from "geoip-lite";
 import dotenv from "dotenv";
 import passport from "passport";
 import session from "express-session";
-import pgSession from "connect-pg-simple";
+import pgSessionImport from "connect-pg-simple";
 import jwt from "jsonwebtoken";
 import cors from "cors";
 import http from "http";
@@ -48,11 +48,13 @@ const BAN_HOURS = 750;
 const UNBAN_PRICE = 5.99;
 
 // ------------------- SESSION & PASSPORT -------------------
+const pgSession = pgSessionImport(session);
+
 app.use(
   session({
     store: new pgSession({
-      pool: pool,                // your existing pg Pool
-      tableName: "user_sessions" // optional table name (default: "session")
+      pool: pool,                // your PostgreSQL pool
+      tableName: "user_sessions" // optional table name
     }),
     secret: process.env.SESSION_SECRET || "session_secret_omevo",
     resave: false,
