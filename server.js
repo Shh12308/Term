@@ -5,6 +5,7 @@ import geoip from "geoip-lite";
 import dotenv from "dotenv";
 import passport from "passport";
 import session from "express-session";
+import pgSession from "connect-pg-simple";
 import jwt from "jsonwebtoken";
 import cors from "cors";
 import http from "http";
@@ -49,9 +50,14 @@ const UNBAN_PRICE = 5.99;
 // ------------------- SESSION & PASSPORT -------------------
 app.use(
   session({
+    store: new pgSession({
+      pool: pool,                // your existing pg Pool
+      tableName: "user_sessions" // optional table name (default: "session")
+    }),
     secret: process.env.SESSION_SECRET || "session_secret_omevo",
     resave: false,
     saveUninitialized: false,
+    cookie: { maxAge: 14 * 24 * 60 * 60 * 1000 }, // 14 days
   })
 );
 app.use(passport.initialize());
