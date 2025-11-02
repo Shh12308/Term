@@ -1,6 +1,7 @@
-// server.js - Complete backend for OmeVo/Monkey-style app
+// server.js - Complete backend for OmeVo app
 import express from "express";
 import pg from "pg";
+import geoip from "geoip-lite"; 
 import dotenv from "dotenv";
 import passport from "passport";
 import session from "express-session";
@@ -314,19 +315,19 @@ app.post("/api/user/preferences", requireAuth, async (req, res) => {
   }
 });
 
-import geoip from "geoip-lite";
+
 
 app.post("/queue/enqueue", requireAuth, async (req, res) => {
   try {
-    let { gender="any", location="any", interests="", nickname="" } = req.body;
+    let { gender = "any", location = "any", interests = "", nickname = "" } = req.body;
     const userId = String(req.user.id);
 
-    // If no explicit location provided, infer from IP
-    if (location === "any") {
+    // Auto-detect location from IP if user did not select one
+    if (location === "any" || !location) {
       const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress;
       const geo = geoip.lookup(ip);
       if (geo && geo.country) {
-        location = geo.country.toLowerCase();  // e.g., "us", "ca"
+        location = geo.country.toLowerCase(); // e.g. "us", "gb", "ca"
       }
     }
 
@@ -340,9 +341,10 @@ app.post("/queue/enqueue", requireAuth, async (req, res) => {
     );
 
     const match = await tryFindMatch(userId, gender, location);
-    if (match) return res.json({ matched: true, peerId: match.peerId, channel: match.channel });
+    if (match)
+      return res.json({ matched: true, peerId: match.peerId, channel: match.channel });
 
-    return res.json({ matched: false });
+    return res.json({ matched: false, locationUsed: location });
   } catch (err) {
     console.error("enqueue error:", err);
     res.status(500).json({ error: "enqueue failed" });
