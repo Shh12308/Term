@@ -258,6 +258,221 @@ io.on("connection", (socket) => {
   });
 });
 
+// ------------------- USER PROFILE ENDPOINTS -------------------
+
+// Get user profile
+app.get("/api/user/:id", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await pool.query(
+      `SELECT id, username, email, gender, location,
+              created_at, updated_at, banned_until
+       FROM users WHERE id = $1`,
+      [id]
+    );
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error("Fetch user failed:", err);
+    res.status(500).json({ error: "Could not fetch user" });
+  }
+});
+
+// Update profile
+app.post("/api/user/update", requireAuth, async (req, res) => {
+  try {
+    const { username, gender, location } = req.body;
+    await pool.query(
+      "UPDATE users SET username=$1, gender=$2, location=$3, updated_at=NOW() WHERE id=$4",
+      [username, gender, location, req.user.id]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Update user failed:", err);
+    res.status(500).json({ error: "Could not update user" });
+  }
+});
+
+// Delete account
+app.delete("/api/user/delete", requireAuth, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM users WHERE id=$1", [req.user.id]);
+    res.json({ ok: true, deleted: true });
+  } catch (err) {
+    console.error("Delete user failed:", err);
+    res.status(500).json({ error: "Could not delete user" });
+  }
+});
+
+
+// ------------------- MATCH HISTORY -------------------
+
+app.get("/api/matches", requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM matches 
+       WHERE user_a=$1 OR user_b=$1 
+       ORDER BY created_at DESC LIMIT 50`,
+      [req.user.id]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error("Fetch matches failed:", err);
+    res.status(500).json({ error: "Could not fetch matches" });
+  }
+});
+
+app.delete("/api/matches/:id", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query(
+      "DELETE FROM matches WHERE id=$1 AND (user_a=$2 OR user_b=$2)",
+      [id, req.user.id]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Delete match failed:", err);
+    res.status(500).json({ error: "Could not delete match" });
+  }
+});
+
+
+// ------------------- BAN & MODERATION -------------------
+
+// Check if user is banned + remaining time
+app.get("/api/user/ban-status", requireAuth, async (req, res) => {
+  try {
+    const { banned_until } = req.user;
+    if (!banned_until)
+      return res.json({ banned: false, remaining_hours: 0, can_pay_to_unban: false });
+
+    const now = new Date();
+    const banEnd = new Date(banned_until);
+    const banned = banEnd > now;
+    const remainingHours = Math.max(
+      0,
+      Math.ceil((banEnd - now) / (1000 * 60 * 60))
+    );
+
+    res.json({
+      banned,
+      banned_until,
+      remaining_hours: remainingHours,
+      can_pay_to_unban: banned,
+      unban_price: 5.99,
+    });
+  } catch (err) {
+    console.error("Check ban failed:", err);
+    res.status(500).json({ error: "Could not check ban status" });
+  }
+});
+
+// Apply a 750-hour ban
+app.post("/api/user/ban", requireAuth, async (req, res) => {
+  try {
+    const adminCheck = await pool.query("SELECT is_admin FROM users WHERE id=$1", [req.user.id]);
+    if (!adminCheck.rows[0]?.is_admin)
+      return res.status(403).json({ error: "Unauthorized" });
+
+    const { targetUserId } = req.body;
+    const banUntil = new Date(Date.now() + 750 * 60 * 60 * 1000); // 750 hours
+
+    await pool.query("UPDATE users SET banned_until=$1 WHERE id=$2", [
+      banUntil,
+      targetUserId,
+    ]);
+    res.json({ ok: true, banned_until: banUntil });
+  } catch (err) {
+    console.error("Apply ban failed:", err);
+    res.status(500).json({ error: "Could not apply ban" });
+  }
+});
+
+// Pay to remove ban ($5.99)
+app.post("/api/pay-unban", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const session = await STRIPE.checkout.sessions.create({
+      payment_method_types: ["card"],
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            product_data: {
+              name: "Ban Removal",
+              description: "Remove your OmeVo account suspension immediately",
+            },
+            unit_amount: 599, // $5.99
+          },
+          quantity: 1,
+        },
+      ],
+      mode: "payment",
+      success_url: `${process.env.FRONTEND_URL}/unban-success?userId=${userId}`,
+      cancel_url: `${process.env.FRONTEND_URL}/unban-cancel`,
+      metadata: { userId },
+    });
+
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error("Stripe unban payment error:", err);
+    res.status(500).json({ error: "Failed to create payment session" });
+  }
+});
+
+// Stripe webhook — automatically unban on successful payment
+app.post(
+  "/api/stripe-webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"];
+    let event;
+
+    try {
+      event = STRIPE.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error("Webhook signature verification failed:", err);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+      const userId = session.metadata?.userId;
+
+      if (userId) {
+        try {
+          await pool.query("UPDATE users SET banned_until=NULL WHERE id=$1", [userId]);
+          console.log(`✅ User ${userId} unbanned after payment`);
+        } catch (err) {
+          console.error("DB unban error:", err);
+        }
+      }
+    }
+
+    res.status(200).json({ received: true });
+  }
+);
+
+// Appeal a ban (optional)
+app.post("/api/moderation/appeal", requireAuth, async (req, res) => {
+  try {
+    const { message } = req.body;
+    await pool.query(
+      "INSERT INTO appeals (user_id, message, created_at) VALUES ($1, $2, NOW())",
+      [req.user.id, message || ""]
+    );
+    res.json({ ok: true, message: "Appeal submitted" });
+  } catch (err) {
+    console.error("Appeal failed:", err);
+    res.status(500).json({ error: "Could not submit appeal" });
+  }
+});
+
 // ------------------- MATCHMAKING -------------------
 async function tryFindMatch(userId, genderPref, locationPref) {
   const candidateQuery = `
