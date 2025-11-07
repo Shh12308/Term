@@ -1,4 +1,4 @@
-// server.js - Complete backend for OmeVo app
+// server.js - Backend for OmeVo app with Socket.IO WebRTC signalling
 import express from "express";
 import pg from "pg";
 import geoip from "geoip-lite"; 
@@ -53,13 +53,13 @@ const pgSession = pgSessionImport(session);
 app.use(
   session({
     store: new pgSession({
-      pool: pool,                // your PostgreSQL pool
-      tableName: "user_sessions" // optional table name
+      pool: pool,
+      tableName: "user_sessions"
     }),
     secret: process.env.SESSION_SECRET || "session_secret_omevo",
     resave: false,
     saveUninitialized: false,
-    cookie: { maxAge: 14 * 24 * 60 * 60 * 1000 }, // 14 days
+    cookie: { maxAge: 14 * 24 * 60 * 60 * 1000 },
   })
 );
 app.use(passport.initialize());
@@ -76,7 +76,7 @@ passport.deserializeUser(async (id, done) => {
 });
 
 // ------------------- PASSPORT STRATEGIES -------------------
-// Google, Discord, Facebook - upsert user if exists
+// Google
 passport.use(
   new GoogleStrategy(
     {
@@ -103,6 +103,7 @@ passport.use(
   )
 );
 
+// Discord
 passport.use(
   new DiscordStrategy(
     {
@@ -130,6 +131,7 @@ passport.use(
   )
 );
 
+// Facebook
 passport.use(
   new FacebookStrategy(
     {
@@ -178,7 +180,7 @@ async function requireAuth(req, res, next) {
   }
 }
 
-// ------------------- OAuth ROUTES -------------------
+// ------------------- OAUTH ROUTES -------------------
 app.get("/auth/google", passport.authenticate("google", { scope: ["profile", "email"] }));
 app.get("/auth/google/callback", passport.authenticate("google", { failureRedirect: "/auth/failure", session: true }), (req, res) => {
   const token = signJwtForUser(req.user);
@@ -203,6 +205,8 @@ app.get("/auth/failure", (req, res) => res.status(401).json({ error: "Authentica
 const onlineSockets = new Map();
 
 io.on("connection", (socket) => {
+
+  // ---- AUTH ----
   socket.on("auth", async ({ token }) => {
     try {
       const decoded = jwt.verify(token, JWT_SECRET);
@@ -219,7 +223,7 @@ io.on("connection", (socket) => {
     if (uid) onlineSockets.delete(String(uid));
   });
 
-  // ------------------- AUTOMATED MODERATION -------------------
+  // ---- AUTOMATED MODERATION ----
   socket.on("chat_message", async ({ message }) => {
     const uid = socket.data.userId;
     if (!uid) return;
@@ -227,18 +231,13 @@ io.on("connection", (socket) => {
       const mod = await OPENAI.moderations.create({ model: "omni-moderation-latest", input: message });
       const flagged = mod.results?.[0]?.categories?.sexual || mod.results?.[0]?.flagged;
       if (flagged) {
-        // Ban user 750 hours
         await pool.query("UPDATE users SET banned_until = NOW() + INTERVAL '750 hours' WHERE id=$1", [uid]);
-        // Notify client and disconnect
         socket.emit("moderation_action", { type: "chat", message, banned: true, duration_hours: BAN_HOURS });
         socket.disconnect(true);
       } else {
-        // Forward message to peers if allowed
         io.emit("chat_message", { uid, message });
       }
-    } catch (err) {
-      console.error("Moderation error:", err);
-    }
+    } catch (err) { console.error("Moderation error:", err); }
   });
 
   socket.on("video_frame", async ({ frameBase64 }) => {
@@ -252,174 +251,163 @@ io.on("connection", (socket) => {
         socket.emit("moderation_action", { type: "video", banned: true, duration_hours: BAN_HOURS });
         socket.disconnect(true);
       }
-    } catch (err) {
-      console.error("Video moderation error:", err);
-    }
+    } catch (err) { console.error("Video moderation error:", err); }
   });
+
+  // ---- WEBSOCKET WebRTC SIGNALLING ----
+  socket.on("join_room", ({ room }) => {
+    if (!room) return;
+    socket.join(room);
+    console.log(`Socket ${socket.id} joined room ${room}`);
+    socket.to(room).emit("peer_joined", { socketId: socket.id });
+  });
+
+  socket.on("leave_room", ({ room }) => {
+    if (!room) return;
+    socket.leave(room);
+    socket.to(room).emit("peer_left", { socketId: socket.id });
+    console.log(`Socket ${socket.id} left room ${room}`);
+  });
+
+  socket.on("webrtc.offer", ({ room, sdp }) => {
+    if (!room || !sdp) return;
+    socket.to(room).emit("webrtc.offer", { from: socket.id, sdp });
+  });
+
+  socket.on("webrtc.answer", ({ room, sdp }) => {
+    if (!room || !sdp) return;
+    socket.to(room).emit("webrtc.answer", { from: socket.id, sdp });
+  });
+
+  socket.on("webrtc.ice", ({ room, candidate }) => {
+    if (!room || !candidate) return;
+    socket.to(room).emit("webrtc.ice", { from: socket.id, candidate });
+  });
+
 });
 
-// ------------------- USER PROFILE ENDPOINTS -------------------
+// ------------------- MATCHMAKING -------------------
+async function tryFindMatch(userId, genderPref, locationPref) {
+  const candidateQuery = `
+    SELECT q.user_id, q.gender, q.location
+    FROM queue q
+    WHERE q.user_id <> $1
+      AND ($2='any' OR q.gender=$2)
+      AND ($3='any' OR q.location=$3)
+    ORDER BY joined_at ASC LIMIT 1`;
+  const { rows } = await pool.query(candidateQuery, [userId, genderPref, locationPref]);
+  if (!rows.length) return null;
 
-// Get user profile
-app.get("/api/user/:id", requireAuth, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { rows } = await pool.query(
-      `SELECT id, username, email, gender, location,
-              created_at, updated_at, banned_until
-       FROM users WHERE id = $1`,
-      [id]
-    );
-    if (!rows.length) return res.status(404).json({ error: "User not found" });
-    res.json(rows[0]);
-  } catch (err) {
-    console.error("Fetch user failed:", err);
-    res.status(500).json({ error: "Could not fetch user" });
-  }
-});
+  const peerId = rows[0].user_id;
+  const channelName = `omevo_${Math.min(Number(userId), Number(peerId))}_${Math.max(Number(userId), Number(peerId))}_${Date.now()}`;
 
-// Update profile
-app.post("/api/user/update", requireAuth, async (req, res) => {
-  try {
-    const { username, gender, location } = req.body;
-    await pool.query(
-      "UPDATE users SET username=$1, gender=$2, location=$3, updated_at=NOW() WHERE id=$4",
-      [username, gender, location, req.user.id]
-    );
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("Update user failed:", err);
-    res.status(500).json({ error: "Could not update user" });
-  }
-});
+  await pool.query(
+    `INSERT INTO matches (user_a, user_b, channel_name, created_at) VALUES ($1,$2,$3,NOW())`,
+    [userId, peerId, channelName]
+  );
 
-// Delete account
-app.delete("/api/user/delete", requireAuth, async (req, res) => {
-  try {
-    await pool.query("DELETE FROM users WHERE id=$1", [req.user.id]);
-    res.json({ ok: true, deleted: true });
-  } catch (err) {
-    console.error("Delete user failed:", err);
-    res.status(500).json({ error: "Could not delete user" });
-  }
-});
+  await pool.query("DELETE FROM queue WHERE user_id IN ($1,$2)", [userId, peerId]).catch(() => {});
 
+  const peerSocketId = onlineSockets.get(String(peerId));
+  if (peerSocketId) io.to(peerSocketId).emit("match_found", { peerId: userId, channel: channelName });
 
-// ------------------- MATCH HISTORY -------------------
+  const requesterSocketId = onlineSockets.get(String(userId));
+  if (requesterSocketId) io.to(requesterSocketId).emit("match_found", { peerId, channel: channelName });
 
-app.get("/api/matches", requireAuth, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT * FROM matches 
-       WHERE user_a=$1 OR user_b=$1 
-       ORDER BY created_at DESC LIMIT 50`,
-      [req.user.id]
-    );
-    res.json(rows);
-  } catch (err) {
-    console.error("Fetch matches failed:", err);
-    res.status(500).json({ error: "Could not fetch matches" });
-  }
-});
+  return { peerId, channel: channelName };
+}
 
-app.delete("/api/matches/:id", requireAuth, async (req, res) => {
-  try {
-    const { id } = req.params;
-    await pool.query(
-      "DELETE FROM matches WHERE id=$1 AND (user_a=$2 OR user_b=$2)",
-      [id, req.user.id]
-    );
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("Delete match failed:", err);
-    res.status(500).json({ error: "Could not delete match" });
-  }
-});
-
-
-// ------------------- BAN & MODERATION -------------------
-
-// Check if user is banned + remaining time
-app.get("/api/user/ban-status", requireAuth, async (req, res) => {
-  try {
-    const { banned_until } = req.user;
-    if (!banned_until)
-      return res.json({ banned: false, remaining_hours: 0, can_pay_to_unban: false });
-
-    const now = new Date();
-    const banEnd = new Date(banned_until);
-    const banned = banEnd > now;
-    const remainingHours = Math.max(
-      0,
-      Math.ceil((banEnd - now) / (1000 * 60 * 60))
-    );
-
-    res.json({
-      banned,
-      banned_until,
-      remaining_hours: remainingHours,
-      can_pay_to_unban: banned,
-      unban_price: 5.99,
-    });
-  } catch (err) {
-    console.error("Check ban failed:", err);
-    res.status(500).json({ error: "Could not check ban status" });
-  }
-});
-
-// Apply a 750-hour ban
-app.post("/api/user/ban", requireAuth, async (req, res) => {
-  try {
-    const adminCheck = await pool.query("SELECT is_admin FROM users WHERE id=$1", [req.user.id]);
-    if (!adminCheck.rows[0]?.is_admin)
-      return res.status(403).json({ error: "Unauthorized" });
-
-    const { targetUserId } = req.body;
-    const banUntil = new Date(Date.now() + 750 * 60 * 60 * 1000); // 750 hours
-
-    await pool.query("UPDATE users SET banned_until=$1 WHERE id=$2", [
-      banUntil,
-      targetUserId,
-    ]);
-    res.json({ ok: true, banned_until: banUntil });
-  } catch (err) {
-    console.error("Apply ban failed:", err);
-    res.status(500).json({ error: "Could not apply ban" });
-  }
-});
-
-// Pay to remove ban ($5.99)
-app.post("/api/pay-unban", requireAuth, async (req, res) => {
+// ------------------- USER PREFERENCES -------------------
+app.get("/api/user/preferences", requireAuth, async (req, res) => {
   try {
     const userId = req.user.id;
+    const { rows } = await pool.query("SELECT gender, location FROM users WHERE id = $1", [userId]);
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+    res.json(rows[0]);
+  } catch (err) { console.error("Fetch preferences failed:", err); res.status(500).json({ error: "Could not fetch preferences" }); }
+});
 
+app.post("/api/user/preferences", requireAuth, async (req, res) => {
+  try {
+    const { gender, location } = req.body;
+    await pool.query("UPDATE users SET gender=$1, location=$2, updated_at=NOW() WHERE id=$3", [gender || "any", location || "any", req.user.id]);
+    res.json({ ok: true });
+  } catch (err) { console.error("Save preferences failed:", err); res.status(500).json({ error: "Could not save preferences" }); }
+});
+
+// ------------------- QUEUE HANDLERS -------------------
+app.post("/queue/enqueue", requireAuth, async (req, res) => {
+  try {
+    let { gender = "any", location = "any", interests = "", nickname = "" } = req.body;
+    const userId = String(req.user.id);
+
+    if (location === "any" || !location) {
+      const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress;
+      const geo = geoip.lookup(ip);
+      if (geo && geo.country) location = geo.country.toLowerCase();
+    }
+
+    await pool.query(
+      `INSERT INTO queue (user_id, gender, location, interests, nickname, joined_at)
+       VALUES ($1,$2,$3,$4,$5,NOW())
+       ON CONFLICT (user_id) DO UPDATE SET gender=EXCLUDED.gender,
+         location=EXCLUDED.location, interests=EXCLUDED.interests,
+         nickname=EXCLUDED.nickname, joined_at=NOW()`,
+      [userId, gender, location, interests, nickname]
+    );
+
+    const match = await tryFindMatch(userId, gender, location);
+    if (match) return res.json({ matched: true, peerId: match.peerId, channel: match.channel });
+
+    return res.json({ matched: false, locationUsed: location });
+  } catch (err) { console.error("enqueue error:", err); res.status(500).json({ error: "enqueue failed" }); }
+});
+
+app.post("/queue/leave", requireAuth, async (req, res) => {
+  try { await pool.query("DELETE FROM queue WHERE user_id=$1", [String(req.user.id)]); return res.json({ ok: true }); } 
+  catch (err) { console.error(err); res.status(500).json({ error: "leave failed" }); }
+});
+
+// ------------------- AGORA TOKEN -------------------
+app.post("/generateToken", requireAuth, async (req, res) => {
+  try {
+    const { channelName, uid: requestedUid, role = "publisher", expirySeconds = 3600 } = req.body;
+    if (!channelName) return res.status(400).json({ error: "channelName required" });
+
+    const uid = requestedUid !== undefined ? String(requestedUid) : String(req.user.id);
+    const rtcRole = role === "publisher" ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER;
+
+    const currentTimestamp = Math.floor(Date.now() / 1000);
+    const privilegeExpiredTs = currentTimestamp + Number(expirySeconds);
+
+    const rtcToken = RtcTokenBuilder.buildTokenWithAccount(
+      AGORA_APP_ID,
+      AGORA_APP_CERT,
+      channelName,
+      uid,
+      rtcRole,
+      privilegeExpiredTs
+    );
+    const rtmToken = RtmTokenBuilder.buildToken(AGORA_APP_ID, AGORA_APP_CERT, uid, privilegeExpiredTs);
+
+    return res.json({ rtcToken, rtmToken, appID: AGORA_APP_ID, uid });
+  } catch (err) { console.error("generateToken error", err); res.status(500).json({ error: "token generation failed" }); }
+});
+
+// ------------------- BAN PAYMENT -------------------
+app.post("/api/pay-unban", async (req, res) => {
+  try {
+    const { userId } = req.body;
     const session = await STRIPE.checkout.sessions.create({
       payment_method_types: ["card"],
-      line_items: [
-        {
-          price_data: {
-            currency: "usd",
-            product_data: {
-              name: "Ban Removal",
-              description: "Remove your OmeVo account suspension immediately",
-            },
-            unit_amount: 599, // $5.99
-          },
-          quantity: 1,
-        },
-      ],
+      line_items: [{ price_data: { currency: "usd", product_data: { name: "Ban Removal", description: "Remove your account suspension" }, unit_amount: 599 }, quantity: 1 }],
       mode: "payment",
       success_url: `${process.env.FRONTEND_URL}/unban-success?userId=${userId}`,
       cancel_url: `${process.env.FRONTEND_URL}/unban-cancel`,
-      metadata: { userId },
     });
-
     res.json({ url: session.url });
-  } catch (err) {
-    console.error("Stripe unban payment error:", err);
-    res.status(500).json({ error: "Failed to create payment session" });
-  }
-});
+  } catch (error) { console.error("Stripe error:", error); res.status(500).json({ error: "Payment failed" }); }
+})
 
 // Stripe webhook — automatically unban on successful payment
 app.post(
