@@ -12,7 +12,7 @@ import cors from "cors";
 import http from "http";
 import { Server as SocketIOServer } from "socket.io";
 import agora from "agora-access-token";
-import CoinbaseCommerce from "@coinbase/commerce-node";
+import CoinbaseCommerce from "coinbase-commerce-node";
 
 const { RtcTokenBuilder, RtcRole, RtmTokenBuilder } = agora;
 const { Client, resources } = CoinbaseCommerce;
