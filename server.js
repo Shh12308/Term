@@ -45,7 +45,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "super_secret_jwt_key";
 const OPENAI = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || "" });
 
 const AGORA_APP_ID = process.env.AGORA_APP_ID;
-const AGORA_APP_CERT = process.env.AGORA_APP_CERTIFICATE;
+const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE;
 
 const BAN_HOURS = 750;
 const UNBAN_PRICE = 5.99;
