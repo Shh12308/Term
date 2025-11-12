@@ -13,6 +13,23 @@ import http from "http";
 import { Server as SocketIOServer } from "socket.io";
 import agora from "agora-access-token";
 import CoinbaseCommerce from "coinbase-commerce-node";
+import { sendEmail } from './mailer.js';
+import { subscriptionPurchaseEmail, storePurchaseEmail, refundEmail, accountUpgradeEmail } from './emails.js';
+
+async function sendPurchaseEmail(user, plan, price, receiptId) {
+  const date = new Date().toLocaleDateString();
+  await sendEmail(
+    user.email,
+    `🎉 MintZa Purchase Confirmation`,
+    subscriptionPurchaseEmail({
+      username: user.username,
+      plan,
+      price,
+      startDate: date,
+      receiptId
+    })
+  );
+}
 
 const { RtcTokenBuilder, RtcRole, RtmTokenBuilder } = agora;
 const { Client, resources } = CoinbaseCommerce;
@@ -80,6 +97,55 @@ passport.deserializeUser(async (id, done) => {
     done(err, null);
   }
 });
+
+// 1️⃣ Subscription Purchase Email
+export const subscriptionPurchaseEmail = ({ username, plan, price, startDate, receiptId }) => `
+  <div style="font-family: Arial, sans-serif; background: #1b1b1b; color: #fff; padding: 20px;">
+    <h2 style="color: #00bfff;">🎉 Subscription Successful!</h2>
+    <p>Hi ${username},</p>
+    <p>Thank you for subscribing to the <strong>${plan}</strong> plan for <strong>$${price}</strong>.</p>
+    <p>Start Date: ${startDate}<br>
+       Receipt ID: <strong>${receiptId}</strong></p>
+    <p>Enjoy all premium features and ad-free viewing!</p>
+    <p style="margin-top: 20px;">— MintZa Team</p>
+  </div>
+`;
+
+// 2️⃣ Gift / Coin Store Purchase Email
+export const storePurchaseEmail = ({ username, itemName, price, balance, receiptId }) => `
+  <div style="font-family: Arial, sans-serif; background: #1b1b1b; color: #fff; padding: 20px;">
+    <h2 style="color: #ffd700;">🎁 Purchase Confirmed!</h2>
+    <p>Hi ${username},</p>
+    <p>You successfully bought <strong>${itemName}</strong> for <strong>${price} coins</strong>.</p>
+    <p>Your new balance: <strong>${balance} coins</strong><br>
+       Receipt ID: <strong>${receiptId}</strong></p>
+    <p>Thank you for supporting MintZa!</p>
+    <p style="margin-top: 20px;">— MintZa Team</p>
+  </div>
+`;
+
+// 3️⃣ Refund / Cancellation Email
+export const refundEmail = ({ username, planOrItem, refundAmount, date, receiptId }) => `
+  <div style="font-family: Arial, sans-serif; background: #1b1b1b; color: #fff; padding: 20px;">
+    <h2 style="color: #ff4500;">💸 Refund Processed</h2>
+    <p>Hi ${username},</p>
+    <p>A refund of <strong>$${refundAmount}</strong> for <strong>${planOrItem}</strong> has been processed on ${date}.</p>
+    <p>Receipt ID: <strong>${receiptId}</strong></p>
+    <p>The amount should reflect in your account within 3–5 business days.</p>
+    <p style="margin-top: 20px;">— MintZa Team</p>
+  </div>
+`;
+
+// 4️⃣ Account Upgrade / Change Email
+export const accountUpgradeEmail = ({ username, oldPlan, newPlan, upgradeDate }) => `
+  <div style="font-family: Arial, sans-serif; background: #1b1b1b; color: #fff; padding: 20px;">
+    <h2 style="color: #32cd32;">🚀 Account Upgraded!</h2>
+    <p>Hi ${username},</p>
+    <p>Your plan has been upgraded from <strong>${oldPlan}</strong> to <strong>${newPlan}</strong> as of ${upgradeDate}.</p>
+    <p>Enjoy your new premium features and perks!</p>
+    <p style="margin-top: 20px;">— MintZa Team</p>
+  </div>
+`;
 
 // ------------------- PASSPORT STRATEGIES -------------------
 passport.use(new GoogleStrategy({
