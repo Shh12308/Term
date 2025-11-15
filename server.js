@@ -13,8 +13,6 @@ import http from "http";
 import { Server as SocketIOServer } from "socket.io";
 import agora from "agora-access-token";
 import CoinbaseCommerce from "coinbase-commerce-node";
-import { sendEmail } from './mailer.js';
-import { subscriptionPurchaseEmail, storePurchaseEmail, refundEmail, accountUpgradeEmail } from './emails.js';
 
 const { RtcTokenBuilder, RtcRole, RtmTokenBuilder } = agora;
 const { Client, resources } = CoinbaseCommerce;
