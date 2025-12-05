@@ -52,12 +52,11 @@ const { Charge } = resources;
 Client.init(process.env.COINBASE_COMMERCE_API_KEY);
 
 // ------------------- SESSION & PASSPORT -------------------
-const pgSession = pgSessionImport(session);
-const pgSessionStore = pgSession(session);
+const PGStore = pgSessionImport(session);
 
 app.use(
   session({
-    store: new pgSessionStore({
+    store: new PGStore({
       pool: pool,
       tableName: "user_sessions",
     }),
