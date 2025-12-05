@@ -1,4 +1,4 @@
-// server.js - Backend for OmeVo app with Socket.IO WebRTC signalling and Coinbase Commerce payments
+// server.js - Backend for OmeVo app with Socket.IO, WebRTC, Coinbase Commerce, and OpenAI moderation
 
 import express from "express";
 import pg from "pg";
@@ -13,10 +13,6 @@ import http from "http";
 import { Server as SocketIOServer } from "socket.io";
 import agora from "agora-access-token";
 import CoinbaseCommerce from "coinbase-commerce-node";
-
-const { RtcTokenBuilder, RtcRole, RtmTokenBuilder } = agora;
-const { Client, resources } = CoinbaseCommerce;
-const { Charge } = resources;
 
 import { Strategy as GoogleStrategy } from "passport-google-oauth20";
 import { Strategy as DiscordStrategy } from "passport-discord";
@@ -51,16 +47,19 @@ const BAN_HOURS = 750;
 const UNBAN_PRICE = 5.99;
 
 // Coinbase Commerce Client
+const { Client, resources } = CoinbaseCommerce;
+const { Charge } = resources;
 Client.init(process.env.COINBASE_COMMERCE_API_KEY);
 
 // ------------------- SESSION & PASSPORT -------------------
 const pgSession = pgSessionImport(session);
+const pgSessionStore = pgSession(session);
 
 app.use(
   session({
-    store: new pgSession({
+    store: new pgSessionStore({
       pool: pool,
-      tableName: "user_sessions"
+      tableName: "user_sessions",
     }),
     secret: process.env.SESSION_SECRET || "session_secret_omevo",
     resave: false,
@@ -68,6 +67,7 @@ app.use(
     cookie: { maxAge: 14 * 24 * 60 * 60 * 1000 },
   })
 );
+
 app.use(passport.initialize());
 app.use(passport.session());
 
@@ -88,7 +88,7 @@ passport.use(new GoogleStrategy({
   callbackURL: process.env.GOOGLE_CALLBACK_URL,
 }, async (accessToken, refreshToken, profile, done) => {
   try {
-    const email = profile.emails?.[0]?.value;
+    const email = profile.emails?.[0]?.value || null;
     const providerId = profile.id;
     const text = `
       INSERT INTO users (username, email, provider, provider_id, created_at, updated_at)
@@ -108,7 +108,7 @@ passport.use(new DiscordStrategy({
   scope: ["identify", "email"],
 }, async (accessToken, refreshToken, profile, done) => {
   try {
-    const email = profile.email;
+    const email = profile.email || null;
     const providerId = profile.id;
     const text = `
       INSERT INTO users (username, email, provider, provider_id, created_at, updated_at)
@@ -186,6 +186,14 @@ app.get("/auth/failure", (req, res) => res.status(401).json({ error: "Authentica
 // ------------------- SOCKET.IO -------------------
 const onlineSockets = new Map();
 
+function requireSocketUser(socket) {
+  if (!socket.data.userId) {
+    socket.disconnect(true);
+    return null;
+  }
+  return socket.data.userId;
+}
+
 io.on("connection", (socket) => {
   socket.on("auth", async ({ token }) => {
     try {
@@ -204,7 +212,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on("chat_message", async ({ message }) => {
-    const uid = socket.data.userId;
+    const uid = requireSocketUser(socket);
     if (!uid) return;
     try {
       const mod = await OPENAI.moderations.create({ model: "omni-moderation-latest", input: message });
@@ -219,9 +227,12 @@ io.on("connection", (socket) => {
     } catch (err) { console.error("Moderation error:", err); }
   });
 
+  let lastFrameModeration = 0;
   socket.on("video_frame", async ({ frameBase64 }) => {
-    const uid = socket.data.userId;
+    const uid = requireSocketUser(socket);
     if (!uid) return;
+    if (Date.now() - lastFrameModeration < 1000) return;
+    lastFrameModeration = Date.now();
     try {
       const mod = await OPENAI.moderations.create({ model: "omni-moderation-latest", input: frameBase64 });
       const flagged = mod.results?.[0]?.categories?.sexual || mod.results?.[0]?.flagged;
@@ -266,7 +277,7 @@ async function tryFindMatch(userId, genderPref, locationPref) {
   const channelName = `omevo_${Math.min(Number(userId), Number(peerId))}_${Math.max(Number(userId), Number(peerId))}_${Date.now()}`;
 
   await pool.query(`INSERT INTO matches (user_a, user_b, channel_name, created_at) VALUES ($1,$2,$3,NOW())`, [userId, peerId, channelName]);
-  await pool.query("DELETE FROM queue WHERE user_id IN ($1,$2)", [userId, peerId]).catch(() => {});
+  await pool.query("DELETE FROM queue WHERE user_id = ANY($1::text[])", [[userId, peerId]]).catch(() => {});
 
   const peerSocketId = onlineSockets.get(String(peerId));
   if (peerSocketId) io.to(peerSocketId).emit("match_found", { peerId: userId, channel: channelName });
@@ -280,8 +291,7 @@ async function tryFindMatch(userId, genderPref, locationPref) {
 // ------------------- USER PREFERENCES -------------------
 app.get("/api/user/preferences", requireAuth, async (req, res) => {
   try {
-    const userId = req.user.id;
-    const { rows } = await pool.query("SELECT gender, location FROM users WHERE id = $1", [userId]);
+    const { rows } = await pool.query("SELECT gender, location FROM users WHERE id = $1", [req.user.id]);
     if (!rows.length) return res.status(404).json({ error: "User not found" });
     res.json(rows[0]);
   } catch (err) { console.error(err); res.status(500).json({ error: "Could not fetch preferences" }); }
@@ -301,10 +311,10 @@ app.post("/queue/enqueue", requireAuth, async (req, res) => {
     let { gender = "any", location = "any", interests = "", nickname = "" } = req.body;
     const userId = String(req.user.id);
 
-    if (location === "any" || !location) {
+    if (!location || location === "any") {
       const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress;
       const geo = geoip.lookup(ip);
-      if (geo && geo.country) location = geo.country.toLowerCase();
+      location = geo?.country?.toLowerCase() || "any";
     }
 
     await pool.query(
@@ -329,6 +339,8 @@ app.post("/queue/leave", requireAuth, async (req, res) => {
 });
 
 // ------------------- AGORA TOKEN GENERATION -------------------
+const { RtcTokenBuilder, RtcRole, RtmTokenBuilder } = agora;
+
 app.post("/generateToken", requireAuth, async (req, res) => {
   try {
     const { channelName, uid: requestedUid, role = "publisher", expirySeconds = 3600 } = req.body;
@@ -342,13 +354,13 @@ app.post("/generateToken", requireAuth, async (req, res) => {
 
     const rtcToken = RtcTokenBuilder.buildTokenWithAccount(
       AGORA_APP_ID,
-      AGORA_APP_CERT,
+      AGORA_APP_CERTIFICATE,
       channelName,
       uid,
       rtcRole,
       privilegeExpiredTs
     );
-    const rtmToken = RtmTokenBuilder.buildToken(AGORA_APP_ID, AGORA_APP_CERT, uid, privilegeExpiredTs);
+    const rtmToken = RtmTokenBuilder.buildToken(AGORA_APP_ID, AGORA_APP_CERTIFICATE, uid, privilegeExpiredTs);
 
     return res.json({ rtcToken, rtmToken, appID: AGORA_APP_ID, uid });
   } catch (err) { console.error(err); res.status(500).json({ error: "token generation failed" }); }
@@ -376,12 +388,16 @@ app.post("/api/pay-unban", async (req, res) => {
 app.post("/api/coinbase-webhook", express.raw({ type: "application/json" }), async (req, res) => {
   const signature = req.headers["x-cc-webhook-signature"];
   try {
-    const event = CoinbaseCommerce.Webhook.verifyEventBody(req.body, signature, process.env.COINBASE_COMMERCE_WEBHOOK_SECRET);
+    const event = CoinbaseCommerce.Webhook.verifyEventBody(req.body.toString(), signature, process.env.COINBASE_COMMERCE_WEBHOOK_SECRET);
+
     if (event.type === "charge:confirmed" || event.type === "charge:resolved") {
       const userId = event.data.metadata?.userId;
-      if (userId) await pool.query("UPDATE users SET banned_until=NULL WHERE id=$1", [userId]);
-            console.log(`✅ User ${userId} unbanned via Coinbase payment`);
+      if (userId) {
+        await pool.query("UPDATE users SET banned_until=NULL WHERE id=$1", [userId]);
+        console.log(`✅ User ${userId} unbanned via Coinbase payment`);
+      }
     }
+
     res.status(200).json({ received: true });
   } catch (err) {
     console.error("Coinbase webhook error:", err);
@@ -393,7 +409,10 @@ app.post("/api/coinbase-webhook", express.raw({ type: "application/json" }), asy
 app.post("/api/moderation/appeal", requireAuth, async (req, res) => {
   try {
     const { message } = req.body;
-    await pool.query("INSERT INTO appeals (user_id, message, created_at) VALUES ($1, $2, NOW())", [req.user.id, message || ""]);
+    await pool.query(
+      "INSERT INTO appeals (user_id, message, created_at) VALUES ($1, $2, NOW())",
+      [req.user.id, message || ""]
+    );
     res.json({ ok: true, message: "Appeal submitted" });
   } catch (err) {
     console.error("Appeal failed:", err);
