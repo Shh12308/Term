@@ -316,6 +316,10 @@ app.post("/queue/enqueue", requireAuth, async (req, res) => {
       location = geo?.country?.toLowerCase() || "any";
     }
 
+    if (req.user.banned_until && new Date(req.user.banned_until) > new Date()) {
+  return res.status(403).json({ error: "Account banned" });
+}
+
     await pool.query(
       `INSERT INTO queue (user_id, gender, location, interests, nickname, joined_at)
        VALUES ($1,$2,$3,$4,$5,NOW())
@@ -363,6 +367,28 @@ app.post("/generateToken", requireAuth, async (req, res) => {
 
     return res.json({ rtcToken, rtmToken, appID: AGORA_APP_ID, uid });
   } catch (err) { console.error(err); res.status(500).json({ error: "token generation failed" }); }
+});
+
+app.post("/user/display-name", requireAuth, async (req, res) => {
+  try {
+    const { display_name } = req.body;
+
+    if (!display_name || display_name.length > 20) {
+      return res.status(400).json({ error: "Invalid display name" });
+    }
+
+    // Optional profanity check here
+
+    await pool.query(
+      "UPDATE users SET username=$1, updated_at=NOW() WHERE id=$2",
+      [display_name, req.user.id]
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Display name update failed:", err);
+    res.status(500).json({ error: "Could not update name" });
+  }
 });
 
 // ------------------- BAN PAYMENT (Coinbase Commerce) -------------------
