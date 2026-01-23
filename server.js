@@ -1,1503 +1,1441 @@
 import express from "express";
+import pg from "pg";
+import geoip from "geoip-lite"; 
 import dotenv from "dotenv";
+import passport from "passport";
+import session from "express-session";
+import pgSessionImport from "connect-pg-simple";
+import jwt from "jsonwebtoken";
+import cors from "cors";
+import http from "http";
+import { Server as SocketIOServer } from "socket.io";
+import agora from "agora-access-token";
+import CoinbaseCommerce from "coinbase-commerce-node";
+import rateLimit from "express-rate-limit";
+import helmet from "helmet";
+import Redis from "ioredis";
+import NodeCache from "node-cache";
+import cron from "node-cron";
+import sharp from "sharp";
+import { createHash } from "crypto";
+
+import { Strategy as GoogleStrategy } from "passport-google-oauth20";
+import { Strategy as DiscordStrategy } from "passport-discord";
+import { Strategy as FacebookStrategy } from "passport-facebook";
+
+import OpenAI from "openai";
+
 dotenv.config();
 
-import cookieParser from "cookie-parser";
-import { PrismaClient } from "@prisma/client";
-import argon2 from "argon2";
-import jwt from "jsonwebtoken";
-import passport from "passport";
-import GoogleStrategy from "passport-google-oauth20";
-import cors from "cors";
-import Stripe from "stripe";
-import bodyParser from "body-parser";
-import helmet from "helmet";
-import rateLimit from "express-rate-limit";
-import morgan from "morgan";
-import winston from "winston";
-import nodemailer from "nodemailer";
-import redis from "redis";
-import axios from "axios";
-import { v4 as uuidv4 } from "uuid";
-
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { MediaConvertClient, CreateJobCommand } from "@aws-sdk/client-mediaconvert";
-
-import { MeiliSearch } from "meilisearch";
-import fetch from "node-fetch";
-import crypto from "crypto";
-import { CloudFrontClient, CreateInvalidationCommand } from "@aws-sdk/client-cloudfront";
-
-const prisma = new PrismaClient();
-
-/* -----------------------------
-   Redis setup for caching and rate limiting
-   ----------------------------- */
-const redisClient = redis.createClient({
-  url: process.env.REDIS_URL || "redis://localhost:6379"
-});
-redisClient.on("error", (err) => logger.error("Redis error:", err));
-redisClient.connect();
-
-/* -----------------------------
-   Environment variables
-   ----------------------------- */
-const {
-  DATABASE_URL,
-  JWT_SECRET,
-  REFRESH_TOKEN_SECRET,
-  GOOGLE_CLIENT_ID,
-  GOOGLE_CLIENT_SECRET,
-  SERVER_BASE_URL,
-  REDIRECT_URI,
-  STRIPE_SECRET_KEY,
-  STRIPE_WEBHOOK_SECRET,
-  SMTP_HOST,
-  SMTP_PORT,
-  SMTP_USER,
-  SMTP_PASS,
-  CORS_ORIGINS,
-  NODE_ENV,
-  PORT,
-  AWS_ACCESS_KEY_ID,
-  AWS_SECRET_ACCESS_KEY,
-  AWS_REGION,
-  S3_BUCKET_NAME,
-  MEDIACONVERT_ROLE_ARN,
-  MEDIACONVERT_ENDPOINT,
-  WATERMARK_LOGO_S3,
-  MEILISEARCH_HOST,
-  MEILISEARCH_API_KEY,
-  CLOUDFRONT_DOMAIN,
-  CLOUDFRONT_KEY_PAIR_ID,
-  CLOUDFRONT_PRIVATE_KEY,
-  ONE_SIGNAL_APP_ID,
-  ONE_SIGNAL_API_KEY,
-  STRIPE_BASIC_PRICE_ID,
-  STRIPE_STANDARD_PRICE_ID,
-  STRIPE_PREMIUM_PRICE_ID,
-  STRIPE_AVOD_PRICE_ID,
-  RAW_UPLOAD_BUCKET,
-  PROCESSED_BUCKET,
-  TMDB_API_KEY,
-  REDIS_URL
-} = process.env;
-
-/* -----------------------------
-   Third-party clients
-   ----------------------------- */
-const stripe = new Stripe(STRIPE_SECRET_KEY || "", { apiVersion: "2022-11-15" });
-
-const tierRenditions = {
-  free: ["_480p"],
-  basic: ["_480p", "_720p"],
-  standard: ["_480p", "_720p", "_1080p"],
-  premium: ["_480p", "_720p", "_1080p", "_2k", "_4k", "_6k", "_8k"],
-};
-
-const s3 = new S3Client({
-  region: AWS_REGION,
-  credentials: { accessKeyId: AWS_ACCESS_KEY_ID, secretAccessKey: AWS_SECRET_ACCESS_KEY },
-});
-
-const cloudfront = new CloudFrontClient({
-  region: AWS_REGION,
-  credentials: { accessKeyId: AWS_ACCESS_KEY_ID, secretAccessKey: AWS_SECRET_ACCESS_KEY },
-});
-
-const mediaconvert = new MediaConvertClient({
-  region: AWS_REGION,
-  credentials: { accessKeyId: AWS_ACCESS_KEY_ID, secretAccessKey: AWS_SECRET_ACCESS_KEY },
-  endpoint: MEDIACONVERT_ENDPOINT || undefined
-});
-
-const meili = MEILISEARCH_HOST ? new MeiliSearch({ host: MEILISEARCH_HOST, apiKey: MEILISEARCH_API_KEY }) : null;
-
-/* -----------------------------
-   Logger
-   ----------------------------- */
-const logger = winston.createLogger({
-  level: NODE_ENV === "production" ? "info" : "debug",
-  format: winston.format.combine(winston.format.timestamp(), winston.format.json()),
-  transports: [
-    new winston.transports.Console(),
-    new winston.transports.File({ filename: "logs/error.log", level: "error" }),
-    new winston.transports.File({ filename: "logs/combined.log" })
-  ]
-});
-
-/* -----------------------------
-   Security and rate limiting helpers
-   ----------------------------- */
-export const checkLoginLock = async (email) => {
-  const key = `login_fail:${email}`;
-  const attempts = await redisClient.get(key);
-  if (attempts && Number(attempts) >= 5) {
-    throw new Error("Account locked. Try again later.");
-  }
-};
-
-export const recordLoginFail = async (email) => {
-  const key = `login_fail:${email}`;
-  await redisClient.multi()
-    .incr(key)
-    .expire(key, 900) // 15 min
-    .exec();
-};
-
-export const clearLoginFails = async (email) => {
-  await redisClient.del(`login_fail:${email}`);
-};
-
-export const isBreachedPassword = async (password) => {
-  const sha1 = crypto.createHash("sha1").update(password).digest("hex");
-  const prefix = sha1.slice(0, 5);
-  const suffix = sha1.slice(5);
-
-  const res = await fetch(`https://api.pwnedpasswords.com/range/${prefix}`);
-  const text = await res.text();
-
-  return text.includes(suffix);
-};
-
-/* -----------------------------
-   App setup
-   ----------------------------- */
+// ------------------- CONFIG -------------------
 const app = express();
-app.set("trust proxy", 1);
-
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "https://apis.google.com"],
       styleSrc: ["'self'", "'unsafe-inline'"],
-      scriptSrc: ["'self'"],
       imgSrc: ["'self'", "data:", "https:"],
+      connectSrc: ["'self'", "wss:", "https://api.openai.com"],
     },
   },
 }));
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true }));
-app.use(cookieParser());
-app.use(morgan("combined", { stream: { write: (msg) => logger.info(msg.trim()) } }));
-const allowed = (CORS_ORIGINS || "http://localhost:3000").split(",");
-app.use(cors({ origin: allowed, credentials: true }));
 
-// Advanced rate limiting
-const limiter = rateLimit({
+app.use(cors({ 
+  origin: process.env.FRONTEND_URL || "*", 
+  credentials: true 
+}));
+
+// Rate limiting
+const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per windowMs
+  max: 100, // limit each IP to 100 requests per windowMs
   message: "Too many requests from this IP, please try again later",
   standardHeaders: true,
   legacyHeaders: false,
 });
-app.use(limiter);
 
-// Auth-specific rate limiting
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // Limit each IP to 5 auth requests per windowMs
+  max: 5, // limit each IP to 5 auth requests per windowMs
   message: "Too many authentication attempts, please try again later",
-  standardHeaders: true,
-  legacyHeaders: false,
+  skipSuccessfulRequests: true,
 });
 
-/* -----------------------------
-   Passport Google OAuth
-   ----------------------------- */
-const serverBase = SERVER_BASE_URL || `http://localhost:${PORT || 5000}`;
-const googleCallback = `${serverBase}/api/auth/google/callback`;
+app.use(express.json({ limit: "5mb" }));
+const server = http.createServer(app);
+const io = new SocketIOServer(server, { 
+  cors: { 
+    origin: process.env.FRONTEND_URL || "*",
+    credentials: true
+  },
+  pingTimeout: 60000,
+  pingInterval: 25000
+});
 
-passport.use(new GoogleStrategy.Strategy({
-  clientID: GOOGLE_CLIENT_ID,
-  clientSecret: GOOGLE_CLIENT_SECRET,
-  callbackURL: googleCallback
+// Redis for session storage and caching
+const redis = new Redis({
+  host: process.env.REDIS_HOST || "localhost",
+  port: process.env.REDIS_PORT || 6379,
+  password: process.env.REDIS_PASSWORD,
+  retryDelayOnFailover: 100,
+  maxRetriesPerRequest: 3,
+});
+
+// In-memory cache for frequently accessed data
+const userCache = new NodeCache({ stdTTL: 300 }); // 5 minutes cache
+
+const pool = new pg.Pool({
+  user: process.env.DB_USER,
+  host: process.env.DB_HOST,
+  database: process.env.DB_NAME,
+  password: process.env.DB_PASS,
+  port: process.env.DB_PORT,
+  max: 20, // Maximum number of clients in the pool
+  idleTimeoutMillis: 30000, // How long a client is allowed to remain idle before being closed
+  connectionTimeoutMillis: 2000, // How long to wait when connecting a new client
+});
+
+const JWT_SECRET = process.env.JWT_SECRET || "super_secret_jwt_key";
+const OPENAI = new OpenAI({ 
+  apiKey: process.env.OPENAI_API_KEY || "",
+  timeout: 30000,
+  maxRetries: 2
+});
+
+const AGORA_APP_ID = process.env.AGORA_APP_ID;
+const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE;
+
+const BAN_HOURS = 750;
+const UNBAN_PRICE = 5.99;
+const MAX_INTERESTS = 5;
+const MAX_NICKNAME_LENGTH = 20;
+const MIN_AGE_FOR_VIDEO = 18; // Minimum age to use video
+
+// Coinbase Commerce Client
+const { Client, resources } = CoinbaseCommerce;
+const { Charge } = resources;
+Client.init(process.env.COINBASE_COMMERCE_API_KEY);
+
+// ------------------- SESSION & PASSPORT -------------------
+const PGStore = pgSessionImport(session);
+
+app.use(
+  session({
+    store: new PGStore({
+      pool: pool,
+      tableName: "user_sessions",
+      createTableIfMissing: true,
+    }),
+    secret: process.env.SESSION_SECRET || "session_secret_omevo",
+    resave: false,
+    saveUninitialized: false,
+    cookie: { 
+      maxAge: 14 * 24 * 60 * 60 * 1000,
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax"
+    },
+  })
+);
+
+app.use(passport.initialize());
+app.use(passport.session());
+
+passport.serializeUser((user, done) => done(null, user.id));
+passport.deserializeUser(async (id, done) => {
+  try {
+    // Check cache first
+    const cachedUser = userCache.get(`user:${id}`);
+    if (cachedUser) return done(null, cachedUser);
+    
+    const { rows } = await pool.query("SELECT * FROM users WHERE id=$1", [id]);
+    if (rows[0]) {
+      userCache.set(`user:${id}`, rows[0]);
+    }
+    done(null, rows[0] || null);
+  } catch (err) {
+    done(err, null);
+  }
+});
+
+// ------------------- PASSPORT STRATEGIES -------------------
+passport.use(new GoogleStrategy({
+  clientID: process.env.GOOGLE_CLIENT_ID,
+  clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+  callbackURL: process.env.GOOGLE_CALLBACK_URL,
 }, async (accessToken, refreshToken, profile, done) => {
   try {
-    const email = profile.emails?.[0]?.value;
-    if (!email) return done(new Error("No email"), null);
-    let user = await prisma.user.findUnique({ where: { email } });
-    if (!user) {
-      user = await prisma.user.create({
-        data: {
-          googleId: profile.id,
-          name: profile.displayName || email.split("@")[0],
-          email,
-          picture: profile.photos?.[0]?.value || null,
-          subscriptionType: "free",
-          role: "user"
-        }
-      });
-    } else if (!user.googleId) {
-      user = await prisma.user.update({ where: { email }, data: { googleId: profile.id, picture: profile.photos?.[0]?.value || user.picture } });
+    const email = profile.emails?.[0]?.value || null;
+    const providerId = profile.id;
+    const avatar = profile.photos?.[0]?.value || null;
+    
+    // Check if user is already in database
+    const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
+    
+    if (rows.length > 0) {
+      // Update existing user with Google info
+      const updateQuery = `
+        UPDATE users 
+        SET provider='google', provider_id=$1, username=$2, avatar=$3, updated_at=NOW()
+        WHERE id=$4
+        RETURNING *`;
+      const values = [providerId, profile.displayName || profile.username || email, avatar, rows[0].id];
+      const result = await pool.query(updateQuery, values);
+      return done(null, result.rows[0]);
     }
-    return done(null, user);
-  } catch (err) {
-    logger.error("Google strategy error", err);
-    return done(err, null);
-  }
+    
+    // Create new user
+    const text = `
+      INSERT INTO users (username, email, provider, provider_id, avatar, created_at, updated_at)
+      VALUES ($1,$2,'google',$3,$4,NOW(),NOW())
+      RETURNING *`;
+    const values = [profile.displayName || profile.username || email, email, providerId, avatar];
+    const result = await pool.query(text, values);
+    done(null, result.rows[0]);
+  } catch (err) { done(err, null); }
 }));
-app.use(passport.initialize());
 
-/* -----------------------------
-   JWT helpers & RBAC
-   ----------------------------- */
-const signRefreshToken = (payload) =>
-  jwt.sign(payload, REFRESH_TOKEN_SECRET || "refresh_secret", { expiresIn: "7d" });
-
-const signToken = (payload, expiresIn = "7d") => jwt.sign(payload, JWT_SECRET || "secret", { expiresIn });
-const verifyToken = (token) => jwt.verify(token, JWT_SECRET || "secret");
-
-const requireAuth = async (req, res, next) => {
+passport.use(new DiscordStrategy({
+  clientID: process.env.DISCORD_CLIENT_ID,
+  clientSecret: process.env.DISCORD_CLIENT_SECRET,
+  callbackURL: process.env.DISCORD_CALLBACK_URL,
+  scope: ["identify", "email"],
+}, async (accessToken, refreshToken, profile, done) => {
   try {
-    const header = req.headers.authorization || req.cookies?.token;
-    if (!header) return res.status(401).json({ error: "Missing token" });
-    const token = header.startsWith("Bearer ") ? header.split(" ")[1] : header;
-    const decoded = verifyToken(token);
-    const user = await prisma.user.findUnique({ where: { id: decoded.id } });
-    if (!user) return res.status(404).json({ error: "User not found" });
-    if (user.isBanned) return res.status(403).json({ error: "Banned" });
+    const email = profile.email || null;
+    const providerId = profile.id;
+    const avatar = profile.avatar ? `https://cdn.discordapp.com/avatars/${profile.id}/${profile.avatar}.png` : null;
     
-    // Check if token version matches (for global logout)
-    if (decoded.v !== user.tokenVersion) {
-      return res.status(401).json({ error: "Token revoked" });
+    // Check if user is already in database
+    const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
+    
+    if (rows.length > 0) {
+      // Update existing user with Discord info
+      const updateQuery = `
+        UPDATE users 
+        SET provider='discord', provider_id=$1, username=$2, avatar=$3, updated_at=NOW()
+        WHERE id=$4
+        RETURNING *`;
+      const values = [providerId, profile.username || profile.displayName, avatar, rows[0].id];
+      const result = await pool.query(updateQuery, values);
+      return done(null, result.rows[0]);
     }
     
-    req.user = user;
+    // Create new user
+    const text = `
+      INSERT INTO users (username, email, provider, provider_id, avatar, created_at, updated_at)
+      VALUES ($1,$2,'discord',$3,$4,NOW(),NOW())
+      RETURNING *`;
+    const values = [profile.username || profile.displayName, email, providerId, avatar];
+    const result = await pool.query(text, values);
+    done(null, result.rows[0]);
+  } catch (err) { done(err, null); }
+}));
+
+passport.use(new FacebookStrategy({
+  clientID: process.env.FACEBOOK_APP_ID,
+  clientSecret: process.env.FACEBOOK_APP_SECRET,
+  callbackURL: process.env.FACEBOOK_CALLBACK_URL,
+  profileFields: ["id", "displayName", "emails", "photos"],
+}, async (accessToken, refreshToken, profile, done) => {
+  try {
+    const email = profile.emails?.[0]?.value || null;
+    const providerId = profile.id;
+    const avatar = profile.photos?.[0]?.value || null;
+    
+    // Check if user is already in database
+    const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
+    
+    if (rows.length > 0) {
+      // Update existing user with Facebook info
+      const updateQuery = `
+        UPDATE users 
+        SET provider='facebook', provider_id=$1, username=$2, avatar=$3, updated_at=NOW()
+        WHERE id=$4
+        RETURNING *`;
+      const values = [providerId, profile.displayName || profile.username, avatar, rows[0].id];
+      const result = await pool.query(updateQuery, values);
+      return done(null, result.rows[0]);
+    }
+    
+    // Create new user
+    const text = `
+      INSERT INTO users (username, email, provider, provider_id, avatar, created_at, updated_at)
+      VALUES ($1,$2,'facebook',$3,$4,NOW(),NOW())
+      RETURNING *`;
+    const values = [profile.displayName || profile.username || email, email, providerId, avatar];
+    const result = await pool.query(text, values);
+    done(null, result.rows[0]);
+  } catch (err) { done(err, null); }
+}));
+
+// ------------------- JWT HELPER -------------------
+function signJwtForUser(user) {
+  const payload = { 
+    id: user.id, 
+    email: user.email, 
+    provider: user.provider,
+    iat: Math.floor(Date.now() / 1000)
+  };
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: "14d" });
+}
+
+async function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization || req.body.token || req.query.token;
+  if (!authHeader) return res.status(401).json({ error: "Missing token" });
+  const token = authHeader.replace(/^Bearer\s*/i, "");
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    
+    // Check cache first
+    const cachedUser = userCache.get(`user:${decoded.id}`);
+    if (cachedUser) {
+      req.user = cachedUser;
+      return next();
+    }
+    
+    const { rows } = await pool.query("SELECT * FROM users WHERE id=$1", [decoded.id]);
+    if (!rows[0]) return res.status(401).json({ error: "User not found" });
+    
+    // Cache the user
+    userCache.set(`user:${decoded.id}`, rows[0]);
+    req.user = rows[0];
     next();
   } catch (err) {
-    logger.warn("Auth error", err?.message || err);
     return res.status(401).json({ error: "Invalid token" });
   }
-};
-
-const requireRoles = (roles = []) => (req, res, next) => {
-  if (!req.user) return res.status(401).json({ error: "Unauthorized" });
-  if (!roles.includes(req.user.role)) return res.status(403).json({ error: "Forbidden" });
-  next();
-};
-
-const requireProvider = (req, res, next) => {
-  if (!req.user) return res.status(401).json({ error: "Unauthorized" });
-  if (req.user.role !== "provider") return res.status(403).json({ error: "Providers only" });
-  next();
-};
-
-const PASSWORD_PEPPER = process.env.PASSWORD_PEPPER || "";
-
-const hashPassword = async (password) => {
-  return argon2.hash(password + PASSWORD_PEPPER, {
-    type: argon2.argon2id,
-    memoryCost: 65536, // 64 MB
-    timeCost: 3,
-    parallelism: 2
-  });
-};
-
-const verifyPassword = async (hash, password) => {
-  return argon2.verify(hash, password + PASSWORD_PEPPER);
-};
-
-// Password migration function (from bcrypt to argon2)
-const verifyAndMigratePassword = async (user, password) => {
-  if (user.password.startsWith("$2")) {
-    // This is a bcrypt hash, verify and migrate
-    const bcrypt = await import("bcrypt");
-    const valid = await bcrypt.compare(password, user.password);
-    if (valid) {
-      // Update to argon2
-      const newHash = await hashPassword(password);
-      await prisma.user.update({
-        where: { id: user.id },
-        data: { password: newHash }
-      });
-      return true;
-    }
-    return false;
-  } else {
-    // This is an argon2 hash
-    return await verifyPassword(user.password, password);
-  }
-};
-
-/* -----------------------------
-   Email helper
-   ----------------------------- */
-const sendMail = async ({ to, subject, text, html }) => {
-  if (!SMTP_HOST) {
-    logger.warn("SMTP not configured - skipping email");
-    return;
-  }
-  const transporter = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: Number(SMTP_PORT || 587),
-    secure: Number(SMTP_PORT || 587) === 465,
-    auth: { user: SMTP_USER, pass: SMTP_PASS }
-  });
-  return transporter.sendMail({ from: SMTP_USER, to, subject, text, html });
-};
-
-/* -----------------------------
-   Utility: CloudFront signed URL implementation
-   ----------------------------- */
-function getCloudFrontUrl(path, expiresInSeconds = 3600) {
-  if (!CLOUDFRONT_DOMAIN) {
-    return `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${path}`;
-  }
-  
-  if (!CLOUDFRONT_KEY_PAIR_ID || !CLOUDFRONT_PRIVATE_KEY) {
-    // If no signing credentials, return unsigned URL
-    return `https://${CLOUDFRONT_DOMAIN}/${path}`;
-  }
-  
-  // Create a signed CloudFront URL
-  const dateLessThan = new Date();
-  dateLessThan.setSeconds(dateLessThan.getSeconds() + expiresInSeconds);
-  
-  const policy = {
-    Statement: [
-      {
-        Resource: `https://${CLOUDFRONT_DOMAIN}/${path}`,
-        Condition: {
-          DateLessThan: { "AWS:EpochTime": Math.floor(dateLessThan.getTime() / 1000) }
-        }
-      }
-    ]
-  };
-  
-  const policyString = JSON.stringify(policy);
-  const policyBase64 = Buffer.from(policyString).toString("base64");
-  
-  const sign = crypto.createSign("RSA-SHA1");
-  sign.update(policyBase64);
-  const signature = sign.sign(CLOUDFRONT_PRIVATE_KEY, "base64");
-  
-  return `https://${CLOUDFRONT_DOMAIN}/${path}?Policy=${policyBase64}&Signature=${signature}&Key-Pair-Id=${CLOUDFRONT_KEY_PAIR_ID}`;
 }
 
-/* -----------------------------
-   MediaConvert job implementation
-   ----------------------------- */
-export async function startMediaConvertJob(inputKey, outputPrefix, tier = "basic") {
-  // Define all possible output resolutions
-  const allOutputs = [
-    { label: "480p", width: 854, height: 480, codec: "H_264", bitrate: 900_000, profile: "MAIN" },
-    { label: "720p", width: 1280, height: 720, codec: "H_264", bitrate: 2_500_000, profile: "MAIN" },
-    { label: "1080p", width: 1920, height: 1080, codec: "H_264", bitrate: 4_500_000, profile: "HIGH" },
-    { label: "2k", width: 2048, height: 1080, codec: "H_265", bitrate: 8_000_000, profile: "MAIN" },
-    { label: "4k", width: 3840, height: 2160, codec: "H_265", bitrate: 15_000_000, profile: "MAIN" },
-    { label: "6k", width: 5760, height: 3240, codec: "H_265", bitrate: 25_000_000, profile: "MAIN" },
-    { label: "8k", width: 7680, height: 4320, codec: "H_265", bitrate: 40_000_000, profile: "MAIN" },
-  ];
-
-  // Select outputs based on subscription tier
-  let selectedOutputs;
-  if (tier === "free") {
-    selectedOutputs = allOutputs.filter(o => o.label === "480p");
-  } else if (tier === "basic") {
-    selectedOutputs = allOutputs.filter(o => o.label === "480p" || o.label === "720p");
-  } else if (tier === "standard") {
-    selectedOutputs = allOutputs.filter(o => o.label === "480p" || o.label === "720p" || o.label === "1080p");
-  } else if (tier === "premium") {
-    selectedOutputs = allOutputs; // all resolutions including 6K/8K
-  } else {
-    throw new Error(`Unknown subscription tier: ${tier}`);
-  }
-
-  // Convert selected outputs into MediaConvert-friendly objects
-  const outputs = selectedOutputs.map(o => ({
-    VideoDescription: o.codec === "H_264"
-      ? {
-          CodecSettings: {
-            Codec: "H_264",
-            H264Settings: {
-              Bitrate: o.bitrate,
-              RateControlMode: "CBR",
-              GopSize: 90,
-              GopSizeUnits: "FRAMES",
-              GopClosedCadence: 1,
-              Profile: o.profile,
-              MaxBitrate: Math.round(o.bitrate * 1.1),
-              EntropyEncoding: "CABAC",
-            },
-          },
-        }
-      : {
-          CodecSettings: {
-            Codec: "H_265",
-            H265Settings: {
-              Bitrate: o.bitrate,
-              RateControlMode: "CBR",
-              GopSize: 90,
-              GopSizeUnits: "FRAMES",
-              Profile: o.profile,
-              MaxBitrate: Math.round(o.bitrate * 1.1),
-            },
-          },
-        },
-    Width: o.width,
-    Height: o.height,
-    AudioDescriptions: [
-      {
-        CodecSettings: {
-          Codec: "AAC",
-          AacSettings: { Bitrate: 128_000, CodingMode: "CODING_MODE_2_0", SampleRate: 48_000 },
-        },
-      },
-    ],
-    OutputSettings: {
-      HlsSettings: {
-        SegmentModifier: `_${o.label}`,
-        HlsOutputSettings: { NameModifier: `_${o.label}` },
-      },
-    },
-  }));
-
-  // Create the MediaConvert job parameters
-  const params = {
-    Role: MEDIACONVERT_ROLE_ARN,
-    Settings: {
-      TimecodeConfig: { Source: "ZEROBASED" },
-      Inputs: [
-        {
-          FileInput: `s3://${RAW_UPLOAD_BUCKET}/${inputKey}`,
-          AudioSelectors: { "Audio Selector 1": { DefaultSelection: "DEFAULT" } },
-          VideoSelector: {},
-          TimecodeSource: "ZEROBASED",
-        },
-      ],
-      OutputGroups: [
-        {
-          Name: "HLS Group",
-          OutputGroupSettings: {
-            Type: "HLS_GROUP_SETTINGS",
-            HlsGroupSettings: {
-              Destination: `s3://${PROCESSED_BUCKET}/${outputPrefix}/`,
-              SegmentLength: 4,
-              ManifestDurationFormat: "INTEGER",
-              DirectoryStructure: "SINGLE_DIRECTORY",
-              ManifestCompression: "NONE",
-              ClientCache: "ENABLED",
-              CodecSpecification: "RFC_4281",
-              OutputSelection: "MANIFESTS_AND_SEGMENTS",
-              HlsCdnSettings: {},
-            },
-          },
-          Outputs: outputs,
-        },
-      ],
-    },
-    UserMetadata: {
-      source: inputKey,
-      output: outputPrefix,
-      tier
-    }
-  };
-
-  try {
-    const command = new CreateJobCommand(params);
-    const response = await mediaconvert.send(command);
-    logger.info("MediaConvert job created", { jobId: response.Job?.Id });
-    return response;
-  } catch (err) {
-    logger.error("MediaConvert job error", err);
-    throw err;
-  }
-}
-
-/* -----------------------------
-   HLS Master Playlist Filtering
-   ----------------------------- */
-async function getFilteredHlsMaster(mediaId, userSubscription) {
-  const allowed = tierRenditions[userSubscription] || ["_480p"];
-  const masterKey = `processed/${mediaId}/master.m3u8`;
-
-  // Check if we have a cached version
-  const cacheKey = `hls_master:${mediaId}:${userSubscription}`;
-  const cached = await redisClient.get(cacheKey);
-  if (cached) {
-    return cached;
-  }
-
-  // Fetch raw master playlist from S3
-  const cmd = new GetObjectCommand({ Bucket: PROCESSED_BUCKET, Key: masterKey });
-  const signedUrl = await getSignedUrl(s3, cmd, { expiresIn: 600 });
-  const response = await fetch(signedUrl);
-  const masterText = await response.text();
-
-  const lines = masterText.split("\n");
-  const filteredLines = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (line.startsWith("#EXT-X-STREAM-INF")) {
-      const nextLine = lines[i + 1];
-      if (allowed.some(r => nextLine.includes(r))) {
-        filteredLines.push(line, nextLine);
-      }
-      i++; // skip the next line
-    } else if (!line.includes(".m3u8")) {
-      filteredLines.push(line); // keep metadata lines
-    }
-  }
-
-  const result = filteredLines.join("\n");
-  
-  // Cache the result for 1 hour
-  await redisClient.setEx(cacheKey, 3600, result);
-  
-  return result;
-}
-
-/* -----------------------------
-   Meilisearch helpers (optional)
-   ----------------------------- */
-async function indexMediaToSearch(media) {
-  if (!meili) return;
-  try {
-    await meili.index("media").addDocuments([{
-      id: media.id,
-      title: media.title,
-      category: media.category,
-      season: media.season,
-      episode: media.episode,
-      forKids: media.forKids,
-      createdAt: media.createdAt
-    }]);
-  } catch (err) {
-    logger.warn("Meili index error", err);
-  }
-}
-
-/* -----------------------------
-   TMDB Helper
-   ----------------------------- */
-const TMDB_BASE = "https://api.themoviedb.org/3";
-
-async function tmdb(path, params = {}) {
-  const { data } = await axios.get(`${TMDB_BASE}${path}`, {
-    params: { api_key: TMDB_API_KEY, ...params }
-  });
-  return data;
-}
-
-function mapTMDB(m) {
-  return {
-    id: m.id,
-    title: m.title || m.name,
-    poster: m.poster_path
-      ? `https://image.tmdb.org/t/p/w500${m.poster_path}`
-      : null,
-    backdrop: m.backdrop_path
-      ? `https://image.tmdb.org/t/p/original${m.backdrop_path}`
-      : null,
-    release: m.release_date,
-    rating: m.vote_average,
-    popularity: m.popularity,
-    genres: m.genre_ids,
-    source: "tmdb"
-  };
-}
-
-/* -----------------------------
-   Helper: check regional availability
-   ----------------------------- */
-async function checkMediaAvailability(mediaId, userCountry) {
-  const cacheKey = `availability:${mediaId}:${userCountry}`;
-  const cached = await redisClient.get(cacheKey);
-  if (cached !== null) {
-    return cached === "true";
-  }
-  
-  const avail = await prisma.mediaAvailability.findFirst({ where: { mediaId } });
-  let result = true;
-  
-  if (avail) {
-    if (avail.blockedCountries?.length && avail.blockedCountries.includes(userCountry)) {
-      result = false;
-    } else if (avail.allowedCountries?.length) {
-      result = avail.allowedCountries.includes(userCountry);
-    }
-  }
-  
-  // Cache for 30 minutes
-  await redisClient.setEx(cacheKey, 1800, result.toString());
-  return result;
-}
-
-/* -----------------------------
-   Stripe price -> tier mapping
-   ----------------------------- */
-const priceToTier = {
-  [STRIPE_BASIC_PRICE_ID]: "basic",
-  [STRIPE_STANDARD_PRICE_ID]: "standard",
-  [STRIPE_PREMIUM_PRICE_ID]: "premium",
-  [STRIPE_AVOD_PRICE_ID]: "avod"
-};
-
-/* -----------------------------
-   Genre definitions
-   ----------------------------- */
-const GENRES = [
-  // Standard Movie Genres
-  { id: 1,  name: "Action" },
-  { id: 2,  name: "Adventure" },
-  { id: 3,  name: "Animation" },
-  { id: 4,  name: "Biography" },
-  { id: 5,  name: "Comedy" },
-  { id: 6,  name: "Crime" },
-  { id: 7,  name: "Documentary" },
-  { id: 8,  name: "Drama" },
-  { id: 9,  name: "Family" },
-  { id: 10, name: "Fantasy" },
-  { id: 11, name: "History" },
-  { id: 12, name: "Horror" },
-  { id: 13, name: "Mystery" },
-  { id: 14, name: "Romance" },
-  { id: 15, name: "Sci-Fi" },
-  { id: 16, name: "Thriller" },
-  { id: 17, name: "War" },
-  { id: 18, name: "Western" },
-  { id: 19, name: "Music" },
-  { id: 20, name: "Musical" },
-
-  // TV Genres
-  { id: 30, name: "Reality" },
-  { id: 31, name: "Talk Show" },
-  { id: 32, name: "Game Show" },
-  { id: 33, name: "News" },
-  { id: 34, name: "Soap" },
-  { id: 35, name: "Variety" },
-
-  // Anime Genres
-  { id: 50, name: "Anime" },
-  { id: 51, name: "Anime Action" },
-  { id: 52, name: "Anime Adventure" },
-  { id: 53, name: "Anime Comedy" },
-  { id: 54, name: "Anime Drama" },
-  { id: 55, name: "Anime Fantasy" },
-  { id: 56, name: "Anime Horror" },
-  { id: 57, name: "Anime Sci-Fi" },
-  { id: 58, name: "Anime Romance" },
-  { id: 59, name: "Anime Mystery" },
-
-  // Sports Genres
-  { id: 70, name: "Sports" },
-  { id: 71, name: "Sports Documentary" },
-  { id: 72, name: "Live Sports" },
-  { id: 73, name: "Esports" },
-  { id: 74, name: "Wrestling" },
-  { id: 75, name: "MMA" },
-  { id: 76, name: "Football" },
-  { id: 77, name: "Basketball" },
-  { id: 78, name: "Baseball" },
-  { id: 79, name: "Soccer" },
-
-  // Music Content
-  { id: 90, name: "Music Videos" },
-  { id: 91, name: "Concerts" },
-
-  // Lifestyle Content
-  { id: 100, name: "Lifestyle" },
-  { id: 101, name: "Travel" },
-  { id: 102, name: "Food" },
-  { id: 103, name: "Art & Culture" }
-];
-
-/* -----------------------------
-   API Routes
-   ----------------------------- */
-
-// Health check
-app.get("/", (req, res) => res.json({ message: "ZenStream API (full) up" }));
-
-// Genres
-app.get("/api/genres", (req, res) => {
-  res.json({
-    success: true,
-    genres: GENRES
-  });
+// ------------------- OAUTH ROUTES -------------------
+app.get("/auth/google", authLimiter, passport.authenticate("google", { scope: ["profile", "email"] }));
+app.get("/auth/google/callback", authLimiter, passport.authenticate("google", { failureRedirect: "/auth/failure", session: true }), (req, res) => {
+  const token = signJwtForUser(req.user);
+  res.redirect(`${process.env.FRONTEND_URL || "/"}?token=${token}`);
 });
 
-// Signup
-app.post("/signup", authLimiter, async (req, res) => {
-  try {
-    const { fullName, email, password } = req.body;
-    if (!fullName || !email || !password) {
-      return res.status(400).json({ message: "All fields required" });
-    }
-
-    // Check if password is breached
-    if (await isBreachedPassword(password)) {
-      return res.status(400).json({ message: "Password found in data breaches. Please choose a different password." });
-    }
-
-    const existing = await prisma.user.findUnique({ where: { email } });
-    if (existing) {
-      return res.status(400).json({ message: "Email in use" });
-    }
-
-    const hash = await hashPassword(password);
-
-    const user = await prisma.user.create({
-      data: {
-        name: fullName,
-        email,
-        password: hash,
-        role: "user",
-        subscriptionType: "free"
-      }
-    });
-
-    // Send welcome email
-    await sendMail({
-      to: email,
-      subject: "Welcome to ZenStream",
-      text: `Hi ${fullName},\n\nWelcome to ZenStream! Your account has been created successfully.\n\nBest regards,\nThe ZenStream Team`,
-      html: `<p>Hi ${fullName},</p><p>Welcome to ZenStream! Your account has been created successfully.</p><p>Best regards,<br>The ZenStream Team</p>`
-    });
-
-    res.status(201).json({ userId: user.id });
-  } catch (err) {
-    logger.error("Signup error", err);
-    res.status(500).json({ message: "Server error" });
-  }
+app.get("/auth/discord", authLimiter, passport.authenticate("discord"));
+app.get("/auth/discord/callback", authLimiter, passport.authenticate("discord", { failureRedirect: "/auth/failure", session: true }), (req, res) => {
+  const token = signJwtForUser(req.user);
+  res.redirect(`${process.env.FRONTEND_URL || "/"}?token=${token}`);
 });
 
-// Login
-app.post("/login", authLimiter, async (req, res) => {
-  try {
-    const { email, password } = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({ message: "All fields required" });
-    }
-
-    // Rate-limit / lockout check
-    await checkLoginLock(email);
-
-    const user = await prisma.user.findUnique({ where: { email } });
-    if (!user || !user.password) {
-      await recordLoginFail(email);
-      return res.status(400).json({ message: "Invalid credentials" });
-    }
-
-    // Verify + auto-migrate bcrypt → argon2
-    const ok = await verifyAndMigratePassword(user, password, prisma);
-    if (!ok) {
-      await recordLoginFail(email);
-      return res.status(400).json({ message: "Invalid credentials" });
-    }
-
-    // Success
-    await clearLoginFails(email);
-
-    const token = signToken({
-      id: user.id,
-      v: user.tokenVersion // allows global logout later
-    });
-
-    const refreshToken = signRefreshToken({
-      id: user.id,
-      v: user.tokenVersion
-    });
-
-    // Store refresh token in Redis
-    await redisClient.setEx(`refresh_token:${user.id}`, 7 * 24 * 60 * 60, refreshToken);
-
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { lastLogin: new Date() }
-    });
-
-    // Set refresh token cookie
-    res.cookie("refreshToken", refreshToken, {
-      httpOnly: true,
-      secure: NODE_ENV === "production",
-      sameSite: "strict",
-      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
-    });
-
-    res.json({
-      token,
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        role: user.role,
-        plan: user.subscriptionType
-      }
-    });
-  } catch (err) {
-    logger.error("Login error", err);
-    res.status(429).json({ message: err.message || "Server error" });
-  }
+app.get("/auth/facebook", authLimiter, passport.authenticate("facebook", { scope: ["email"] }));
+app.get("/auth/facebook/callback", authLimiter, passport.authenticate("facebook", { failureRedirect: "/auth/failure", session: true }), (req, res) => {
+  const token = signJwtForUser(req.user);
+  res.redirect(`${process.env.FRONTEND_URL || "/"}?token=${token}`);
 });
 
-// Refresh token
-app.post("/refresh-token", async (req, res) => {
-  try {
-    const token = req.cookies.refreshToken || req.body.refreshToken;
-    if (!token) return res.status(401).json({ error: "Missing refresh token" });
+app.get("/auth/failure", (req, res) => res.status(401).json({ error: "Authentication failed" }));
 
-    let payload = null;
+// ------------------- SOCKET.IO -------------------
+const onlineSockets = new Map();
+const userRooms = new Map(); // Track which room each user is in
+const roomParticipants = new Map(); // Track participants in each room
+
+function requireSocketUser(socket) {
+  if (!socket.data.userId) {
+    socket.disconnect(true);
+    return null;
+  }
+  return socket.data.userId;
+}
+
+// Function to detect and report suspicious behavior
+async function detectSuspiciousBehavior(userId, action, metadata = {}) {
+  try {
+    // Log the activity
+    await pool.query(
+      "INSERT INTO user_activity (user_id, action, metadata, created_at) VALUES ($1, $2, $3, NOW())",
+      [userId, action, JSON.stringify(metadata)]
+    );
+    
+    // Check for patterns of suspicious behavior
+    const { rows } = await pool.query(
+      `SELECT COUNT(*) as count FROM user_activity 
+       WHERE user_id=$1 AND action=$2 AND created_at > NOW() - INTERVAL '1 hour'`,
+      [userId, action]
+    );
+    
+    // If user has performed the same action more than 50 times in an hour, flag for review
+    if (parseInt(rows[0].count) > 50) {
+      await pool.query(
+        "INSERT INTO flagged_users (user_id, reason, created_at) VALUES ($1, $2, NOW())",
+        [userId, `Suspicious activity: ${action} performed ${rows[0].count} times in an hour`]
+      );
+    }
+  } catch (err) {
+    console.error("Error detecting suspicious behavior:", err);
+  }
+}
+
+io.on("connection", (socket) => {
+  socket.on("auth", async ({ token }) => {
     try {
-      payload = jwt.verify(token, REFRESH_TOKEN_SECRET || "refresh_secret");
-    } catch {
-      return res.status(401).json({ error: "Invalid refresh token" });
-    }
-
-    // Check if refresh token exists in Redis
-    const storedToken = await redisClient.get(`refresh_token:${payload.id}`);
-    if (storedToken !== token) {
-      return res.status(401).json({ error: "Refresh token revoked" });
-    }
-
-    const user = await prisma.user.findUnique({ where: { id: payload.id } });
-    if (!user || user.tokenVersion !== payload.v) {
-      return res.status(401).json({ error: "User not found or token revoked" });
-    }
-
-    const newToken = signToken({
-      id: user.id,
-      v: user.tokenVersion
-    });
-
-    res.json({ token: newToken });
-  } catch (err) {
-    logger.error("Refresh token error", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// Logout
-app.post("/logout", async (req, res) => {
-  try {
-    const token = req.cookies.refreshToken || req.body.refreshToken;
-    if (token) {
-      // Remove refresh token from Redis
-      const payload = jwt.decode(token);
-      if (payload && payload.id) {
-        await redisClient.del(`refresh_token:${payload.id}`);
-      }
+      const decoded = jwt.verify(token, JWT_SECRET);
+      onlineSockets.set(String(decoded.id), socket.id);
+      socket.data.userId = String(decoded.id);
+      socket.data.authenticated = true;
       
-      // Clear cookie
-      res.cookie("refreshToken", "", {
-        httpOnly: true,
-        secure: NODE_ENV === "production",
-        sameSite: "strict",
-        maxAge: 0
-      });
-    }
-    
-    res.json({ success: true });
-  } catch (err) {
-    logger.error("Logout error", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// Global logout (invalidate all sessions)
-app.post("/global-logout", requireAuth, async (req, res) => {
-  try {
-    // Increment token version to invalidate all tokens
-    await prisma.user.update({
-      where: { id: req.user.id },
-      data: { tokenVersion: { increment: 1 } }
-    });
-    
-    // Remove all refresh tokens for this user
-    await redisClient.del(`refresh_token:${req.user.id}`);
-    
-    // Clear cookie
-    res.cookie("refreshToken", "", {
-      httpOnly: true,
-      secure: NODE_ENV === "production",
-      sameSite: "strict",
-      maxAge: 0
-    });
-    
-    res.json({ success: true });
-  } catch (err) {
-    logger.error("Global logout error", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// Google OAuth
-app.get("/api/auth/google", passport.authenticate("google", { scope: ["profile", "email"] }));
-app.get("/api/auth/google/callback", passport.authenticate("google", { session: false, failureRedirect: "/auth-failure" }), async (req, res) => {
-  try {
-    const token = signToken({ id: req.user.id, v: req.user.tokenVersion });
-    const refreshToken = signRefreshToken({ id: req.user.id, v: req.user.tokenVersion });
-    
-    // Store refresh token in Redis
-    await redisClient.setEx(`refresh_token:${req.user.id}`, 7 * 24 * 60 * 60, refreshToken);
-    
-    // Set refresh token cookie
-    res.cookie("refreshToken", refreshToken, {
-      httpOnly: true,
-      secure: NODE_ENV === "production",
-      sameSite: "strict",
-      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
-    });
-    
-    const isMobile = req.headers["user-agent"]?.includes("Mobile");
-    if (isMobile) return res.redirect(`yourapp://login-success?token=${token}`);
-    return res.redirect(`${REDIRECT_URI || "http://localhost:3000"}/auth-success?token=${token}`);
-  } catch (err) {
-    logger.error("Google callback error", err);
-    res.status(500).send("Auth failed");
-  }
-});
-
-// Profiles
-app.post("/api/profiles", requireAuth, async (req, res) => {
-  try {
-    const { name, avatar, isKids } = req.body;
-    const profile = await prisma.profile.create({ 
-      data: { 
-        name, 
-        avatar, 
-        isKids: !!isKids, 
-        userId: req.user.id 
-      }
-    });
-    res.json({ profile });
-  } catch (err) {
-    logger.error("Create profile error", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-app.get("/api/profiles", requireAuth, async (req, res) => {
-  try {
-    const profiles = await prisma.profile.findMany({ where: { userId: req.user.id }});
-    res.json({ profiles });
-  } catch (err) {
-    logger.error("Get profiles error", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// Recommendations
-const router = express.Router();
-
-// Because you watched X
-router.get("/recommend/because/:tmdbId", requireAuth, async (req, res) => {
-  const tmdbId = Number(req.params.tmdbId);
-
-  try {
-    const similar = await tmdb(`/movie/${tmdbId}/similar`);
-
-    const boost = await prisma.analyticsEvent.groupBy({
-      by: ["tmdbId"],
-      where: {
-        tmdbId: { in: similar.results.map(m => m.id) },
-        action: "play"
-      },
-      _count: true
-    });
-
-    const boostMap = Object.fromEntries(
-      boost.map(b => [b.tmdbId, b._count])
-    );
-
-    const scored = similar.results.map(m => ({
-      ...m,
-      score: (boostMap[m.id] || 0) + m.popularity
-    }));
-
-    scored.sort((a, b) => b.score - a.score);
-
-    res.json({ results: scored.slice(0, 20).map(mapTMDB) });
-  } catch {
-    res.status(500).json({ error: "Failed" });
-  }
-});
-
-// Taste clustering
-router.get("/recommend/taste", requireAuth, async (req, res) => {
-  const userId = req.user.id;
-
-  const history = await prisma.analyticsEvent.findMany({
-    where: { userId, action: "play", tmdbId: { not: null } },
-    take: 100,
-    orderBy: { at: "desc" }
-  });
-
-  if (!history.length) {
-    return res.redirect("/api/recommend/cold-start");
-  }
-
-  const movies = await Promise.all(
-    history.map(h => tmdb(`/movie/${h.tmdbId}`))
-  );
-
-  const genreScore = {};
-  movies.forEach(m =>
-    m.genres.forEach(g => {
-      genreScore[g.id] = (genreScore[g.id] || 0) + 1;
-    })
-  );
-
-  const topGenres = Object.entries(genreScore)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 3)
-    .map(([id]) => id);
-
-  const discover = await tmdb("/discover/movie", {
-    with_genres: topGenres.join(","),
-    sort_by: "popularity.desc"
-  });
-
-  res.json({ results: discover.results.map(mapTMDB) });
-});
-
-// Hybrid row
-router.get("/recommend/hybrid", requireAuth, async (req, res) => {
-  const uploaded = await prisma.media.findMany({
-    where: { visibility: "public" },
-    orderBy: { views: "desc" },
-    take: 10
-  });
-
-  const popular = await tmdb("/movie/popular");
-
-  res.json({
-    results: [
-      ...uploaded.map(m => ({
-        id: m.id,
-        title: m.title,
-        poster: m.posterUrl,
-        source: "uploaded"
-      })),
-      ...popular.results.slice(0, 10).map(mapTMDB)
-    ]
-  });
-});
-
-// Cold start
-router.get("/recommend/cold-start", async (req, res) => {
-  const [popular, trending] = await Promise.all([
-    tmdb("/movie/popular"),
-    tmdb("/trending/movie/week")
-  ]);
-
-  res.json({
-    results: [...popular.results.slice(0, 10), ...trending.results.slice(0, 10)]
-      .map(mapTMDB)
-  });
-});
-
-// Smart continue watching
-router.get("/user/continue-watching", requireAuth, async (req, res) => {
-  const userId = req.user.id;
-
-  const progress = await prisma.watchProgress.findMany({
-    where: { userId },
-    orderBy: { updatedAt: "desc" }
-  });
-
-  const scored = progress.map(p => {
-    const recency = Date.now() - new Date(p.updatedAt).getTime();
-    const recencyScore = Math.max(0, 30 - recency / 3.6e6); // hours
-
-    const completionBoost =
-      p.progress > 0.7 ? 15 :
-      p.progress > 0.3 ? 8 :
-      -5;
-
-    return {
-      ...p,
-      score: recencyScore + completionBoost
-    };
-  });
-
-  scored.sort((a, b) => b.score - a.score);
-
-  res.json({
-    results: scored.slice(0, 12)
-  });
-});
-
-app.use("/api", router);
-
-// Provider: upload media
-app.post("/api/provider/upload-media", requireAuth, requireProvider, async (req, res) => {
-  try {
-    const {
-      title,
-      category,
-      season,
-      episode,
-      forKids = false
-    } = req.body;
-
-    if (!title || !category) {
-      return res.status(400).json({ error: "title and category required" });
-    }
-
-    const mediaId = uuidv4();
-
-    // S3 raw upload path
-    const rawKey = `raw/${req.user.id}/${mediaId}.mp4`;
-
-    // Create media record in Prisma
-    const media = await prisma.media.create({
-      data: {
-        id: mediaId,
-        title,
-        category,
-        season: season ? Number(season) : null,
-        episode: episode ? Number(episode) : null,
-        forKids,
-        forFreeUsers: false,
-        s3Key: rawKey,
-        processingStatus: "processing",
-        uploadedById: req.user.id
-      }
-    });
-
-    // Generate a pre-signed upload URL
-    const uploadUrl = await getSignedUrl(
-      s3,
-      new PutObjectCommand({
-        Bucket: RAW_UPLOAD_BUCKET,
-        Key: rawKey,
-        ContentType: "video/mp4"
-      }),
-      { expiresIn: 3600 }
-    );
-
-    // Create output folder path for MediaConvert
-    const outputPrefix = `processed/${mediaId}`;
-
-    // Start MediaConvert job
-    const job = await startMediaConvertJob(rawKey, outputPrefix, "basic"); // Default to basic tier
-
-    return res.json({
-      message: "Upload URL generated, MediaConvert job started",
-      uploadUrl,
-      mediaId,
-      jobId: job.Job.Id
-    });
-
-  } catch (err) {
-    console.error("Media upload error", err);
-    return res.status(500).json({
-      error: "Server error during media upload"
-    });
-  }
-});
-
-// Stream endpoint
-app.get("/api/media/:id/stream", requireAuth, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const profileId = req.query.profileId; // optional, for progress check & kid mode
-    const media = await prisma.media.findUnique({ where: { id } });
-    if (!media) return res.status(404).json({ error: "Media not found" });
-
-    // Regional availability
-    if (!(await checkMediaAvailability(media.id, req.user.country))) {
-      return res.status(403).json({ error: "Not available in your region" });
-    }
-
-    // Subscription / free access check
-    if (!req.user.subscriptionActive && !media.forFreeUsers) {
-      return res.status(403).json({ error: "Premium required" });
-    }
-
-    // If HLS/CloudFront assets exist, prefer CloudFront signed HLS path
-    const cdnAsset = await prisma.cdnAsset.findFirst({ 
-      where: { mediaId: id, hlsKey: { not: null } }, 
-      orderBy: { quality: "desc" }
-    });
-    
-    let playbackUrl;
-    if (cdnAsset && cdnAsset.hlsKey) {
-      // For HLS, we need to filter the master playlist based on user's subscription tier
-      const filteredMaster = await getFilteredHlsMaster(id, req.user.subscriptionType);
-      
-      // Cache the filtered playlist in S3 temporarily
-      const filteredKey = `filtered/${id}/${req.user.subscriptionType}/master.m3u8`;
-      await s3.send(new PutObjectCommand({
-        Bucket: PROCESSED_BUCKET,
-        Key: filteredKey,
-        Body: filteredMaster,
-        ContentType: "application/vnd.apple.mpegurl"
-      }));
-      
-      playbackUrl = getCloudFrontUrl(filteredKey, 3600);
-    } else {
-      // Fallback: generate signed S3 GetObject for direct mp4
-      const cmd = new GetObjectCommand({ Bucket: S3_BUCKET_NAME, Key: media.s3Key });
-      playbackUrl = await getSignedUrl(s3, cmd, { expiresIn: 3600 });
-    }
-
-    // Log watch history and analytics
-    await prisma.watchHistory.create({ 
-      data: { 
-        userId: req.user.id, 
-        mediaId: id,
-        profileId: profileId || null
-      }
-    });
-    
-    await prisma.analyticsEvent.create({ 
-      data: { 
-        userId: req.user.id, 
-        profileId: profileId || null, 
-        mediaId: id, 
-        action: "play", 
-        meta: { 
-          source: "stream",
-          subscription: req.user.subscriptionType
-        } 
-      }
-    });
-
-    res.json({ url: playbackUrl });
-  } catch (err) {
-    logger.error("Stream media error", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// Stripe checkout
-app.post("/create-checkout-session", requireAuth, async (req, res) => {
-  try {
-    const { priceId } = req.body;
-    if (!priceId) return res.status(400).json({ error: "Missing priceId" });
-    
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ["card"],
-      mode: "subscription",
-      line_items: [{ price: priceId, quantity: 1 }],
-      success_url: `${REDIRECT_URI || "https://yourfrontend.com"}/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${REDIRECT_URI || "https://yourfrontend.com"}/cancel`,
-      metadata: { userId: req.user.id, priceId }
-    });
-    res.json({ sessionId: session.id });
-  } catch (err) {
-    logger.error("Create checkout error", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Stripe webhook
-app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, res) => {
-  const sig = req.headers["stripe-signature"];
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    logger.error("Stripe webhook signature failed", err?.message || err);
-    return res.status(400).send(`Webhook Error: ${err?.message || err}`);
-  }
-  try {
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object;
-      const userId = session.metadata.userId;
-      const priceId = session.metadata.priceId;
-      const tier = priceToTier[priceId] || "premium";
-      
-      await prisma.user.update({ 
-        where: { id: userId }, 
-        data: { 
-          subscriptionType: tier, 
-          subscriptionActive: true, 
-          subscriptionEnd: null 
+      // Get user data
+      const { rows } = await pool.query("SELECT * FROM users WHERE id=$1", [decoded.id]);
+      if (rows[0]) {
+        socket.data.user = rows[0];
+        
+        // Check if user is banned
+        if (rows[0].banned_until && new Date(rows[0].banned_until) > new Date()) {
+          socket.emit("banned", { 
+            reason: rows[0].ban_reason || "Violation of terms", 
+            until: rows[0].banned_until,
+            canAppeal: true
+          });
+          socket.disconnect(true);
+          return;
         }
+        
+        // Log connection
+        await pool.query(
+          "INSERT INTO user_connections (user_id, socket_id, ip_address, user_agent, created_at) VALUES ($1, $2, $3, $4, NOW())",
+          [decoded.id, socket.id, socket.handshake.address, socket.handshake.headers["user-agent"]]
+        );
+      }
+      
+      console.log("Socket auth success for user:", decoded.id);
+    } catch (err) {
+      socket.disconnect(true);
+    }
+  });
+
+  socket.on("disconnect", async () => {
+    const uid = socket.data.userId;
+    if (uid) {
+      onlineSockets.delete(String(uid));
+      
+      // Leave any rooms the user was in
+      const rooms = userRooms.get(uid);
+      if (rooms) {
+        rooms.forEach(room => {
+          socket.leave(room);
+          
+          // Notify other participants
+          socket.to(room).emit("peer_left", { socketId: socket.id, userId: uid });
+          
+          // Update room participants
+          const participants = roomParticipants.get(room);
+          if (participants) {
+            const index = participants.indexOf(uid);
+            if (index > -1) {
+              participants.splice(index, 1);
+              roomParticipants.set(room, participants);
+            }
+          }
+        });
+        userRooms.delete(uid);
+      }
+      
+      // Log disconnection
+      await pool.query(
+        "UPDATE user_connections SET disconnected_at=NOW() WHERE socket_id=$1 AND disconnected_at IS NULL",
+        [socket.id]
+      ).catch(() => {});
+    }
+  });
+
+  socket.on("chat_message", async ({ message, roomId }) => {
+    const uid = requireSocketUser(socket);
+    if (!uid) return;
+    
+    try {
+      // Check if user is in a room
+      const userRoom = userRooms.get(uid);
+      if (!userRoom || (roomId && !userRoom.includes(roomId))) {
+        socket.emit("error", { message: "You're not in this room" });
+        return;
+      }
+      
+      // Check message length
+      if (message.length > 500) {
+        socket.emit("error", { message: "Message too long" });
+        return;
+      }
+      
+      // Detect suspicious behavior
+      await detectSuspiciousBehavior(uid, "chat_message", { length: message.length });
+      
+      // Moderate the message
+      const mod = await OPENAI.moderations.create({ 
+        model: "omni-moderation-latest", 
+        input: message 
       });
       
-      // Invalidate CloudFront cache for this user's content
-      await cloudfront.send(new CreateInvalidationCommand({
-        DistributionId: process.env.CLOUDFRONT_DISTRIBUTION_ID,
-        InvalidationBatch: {
-          Paths: {
-            Quantity: 1,
-            Items: [`/filtered/*`]
-          },
-          CallerReference: `user-${userId}-${Date.now()}`
-        }
-      }));
+      const flagged = mod.results?.[0]?.categories?.sexual || 
+                    mod.results?.[0]?.categories?.hate || 
+                    mod.results?.[0]?.categories?.violence || 
+                    mod.results?.[0]?.flagged;
       
-      logger.info("Stripe subscription activated", { userId, tier });
-    } else if (event.type === "invoice.payment_failed") {
-      const invoice = event.data.object;
-      const userId = invoice.metadata?.userId;
-      if (userId) {
-        await prisma.user.update({ where: { id: userId }, data: { subscriptionActive: false }});
+      if (flagged) {
+        const banReason = `Inappropriate message: ${mod.results[0].category_scores}`;
+        await pool.query(
+          "UPDATE users SET banned_until = NOW() + INTERVAL '750 hours', ban_reason=$1 WHERE id=$2",
+          [banReason, uid]
+        );
+        
+        socket.emit("moderation_action", { 
+          type: "chat", 
+          message, 
+          banned: true, 
+          duration_hours: BAN_HOURS,
+          reason: banReason
+        });
+        
+        // Log the ban
+        await pool.query(
+          "INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())",
+          [uid, "auto_ban", banReason]
+        );
+        
+        socket.disconnect(true);
+        return;
       }
-    }
-    res.json({ received: true });
-  } catch (err) {
-    logger.error("Webhook processing error", err);
-    res.status(500).send("Webhook internal error");
-  }
-});
-
-// Admin dashboard
-app.get("/api/admin/dashboard", requireAuth, requireRoles(["admin", "superadmin"]), async (req, res) => {
-  try {
-    const totalUsers = await prisma.user.count();
-    const activeSubs = await prisma.user.count({ where: { subscriptionActive: true }});
-    const totalMedia = await prisma.media.count();
-    const plays = await prisma.analyticsEvent.count({ 
-      where: { 
-        action: "play", 
-        at: { gte: new Date(Date.now() - 24*3600*1000) } 
-      } 
-    });
-    
-    // Get subscription breakdown
-    const subsByTier = await prisma.user.groupBy({
-      by: ["subscriptionType"],
-      _count: true
-    });
-    
-    // Get recent uploads
-    const recentUploads = await prisma.media.findMany({
-      take: 5,
-      orderBy: { createdAt: "desc" },
-      include: { uploader: { select: { name: true } } }
-    });
-    
-    res.json({ 
-      totalUsers, 
-      activeSubs, 
-      totalMedia, 
-      plays,
-      subsByTier,
-      recentUploads
-    });
-  } catch (err) {
-    logger.error("Admin dashboard error", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// Advanced trending with AI prediction
-app.get("/api/trending/advanced", requireAuth, async (req, res) => {
-  try {
-    const hours = Number(req.query.hours || 24);
-    const limit = Number(req.query.limit || 20);
-    const country = req.query.country || req.user.country;
-
-    const since = new Date(Date.now() - hours * 3600000);
-
-    // Friends IDs
-    const follows = await prisma.follow.findMany({
-      where: { followerId: req.user.id },
-      select: { followingId: true }
-    });
-    const friendIds = follows.map(f => f.followingId);
-
-    // Trending + geo + friends
-    const trending = await prisma.$queryRaw`
-      SELECT
-        ae."mediaId",
-        COUNT(DISTINCT ae."userId") AS users,
-        MAX(ae.at) AS last_play,
-        (
-          COUNT(DISTINCT ae."userId")
-          *
-          (1 / (EXTRACT(EPOCH FROM (NOW() - MAX(ae.at))) / 3600 + 1))
-          *
-          CASE WHEN ae.country = ${country} THEN 1.25 ELSE 1 END
-          *
-          CASE WHEN ae."userId" = ANY(${friendIds}) THEN 1.3 ELSE 1 END
-        ) AS score
-      FROM "AnalyticsEvent" ae
-      WHERE ae.action = 'play'
-        AND ae.at >= ${since}
-      GROUP BY ae."mediaId"
-      ORDER BY score DESC
-      LIMIT ${limit};
-    `;
-
-    if (!trending.length) {
-      return res.json({ trending: [] });
-    }
-
-    const ids = trending.map(t => t.mediaId);
-
-    // Momentum (24h vs 7d)
-    const momentum = await prisma.$queryRaw`
-      SELECT
-        "mediaId",
-        COUNT(*) FILTER (WHERE at >= NOW() - INTERVAL '24 hours') AS d1,
-        COUNT(*) FILTER (WHERE at >= NOW() - INTERVAL '7 days') AS d7
-      FROM "AnalyticsEvent"
-      WHERE "mediaId" = ANY(${ids})
-      GROUP BY "mediaId";
-    `;
-
-    const momentumMap = new Map(
-      momentum.map(m => [
-        m.mediaId,
-        m.d7 ? Number(m.d1) / Number(m.d7) : 0
-      ])
-    );
-
-    // AI prediction boost
-    function aiBoost(score, momentum) {
-      if (momentum > 0.6) return score * 1.4;
-      if (momentum > 0.4) return score * 1.25;
-      return score;
-    }
-
-    // Media fetch
-    const media = await prisma.media.findMany({
-      where: { id: { in: ids } }
-    });
-    const mediaMap = new Map(media.map(m => [m.id, m]));
-
-    // Final build
-    const result = trending.map(t => {
-      const momentumValue = momentumMap.get(t.mediaId) || 0;
-      const boostedScore = aiBoost(Number(t.score), momentumValue);
-
-      // Save snapshot for charts
-      prisma.trendingSnapshot.create({
-        data: {
-          mediaId: t.mediaId,
-          score: boostedScore,
-          windowHrs: hours
-        }
-      }).catch(() => {});
-
-      return {
-        mediaId: t.mediaId,
-        score: boostedScore,
-        momentum: momentumValue,
-        predictedTrending: momentumValue > 0.5,
-        media: mediaMap.get(t.mediaId)
+      
+      // Save message to database
+      const { rows } = await pool.query(
+        "INSERT INTO chat_messages (user_id, room_id, message, created_at) VALUES ($1, $2, $3, NOW()) RETURNING *",
+        [uid, roomId || userRoom[0], message]
+      );
+      
+      // Broadcast to room
+      const messageData = {
+        id: rows[0].id,
+        uid,
+        message,
+        timestamp: rows[0].created_at,
+        username: socket.data.user.username
       };
-    });
+      
+      if (roomId) {
+        io.to(roomId).emit("chat_message", messageData);
+      } else {
+        io.to(userRoom[0]).emit("chat_message", messageData);
+      }
+    } catch (err) { 
+      console.error("Chat message error:", err); 
+      socket.emit("error", { message: "Failed to send message" });
+    }
+  });
 
-    res.json({
-      windowHours: hours,
-      geo: country,
-      count: result.length,
-      trending: result.sort((a, b) => b.score - a.score)
-    });
+  let lastFrameModeration = 0;
+  socket.on("video_frame", async ({ frameBase64, roomId }) => {
+    const uid = requireSocketUser(socket);
+    if (!uid) return;
+    
+    // Rate limit frame moderation
+    if (Date.now() - lastFrameModeration < 1000) return;
+    lastFrameModeration = Date.now();
+    
+    try {
+      // Check if user is in a room
+      const userRoom = userRooms.get(uid);
+      if (!userRoom || (roomId && !userRoom.includes(roomId))) {
+        return; // Silently ignore if not in room
+      }
+      
+      // Detect suspicious behavior
+      await detectSuspiciousBehavior(uid, "video_frame");
+      
+      // Process image with sharp for optimization
+      const buffer = Buffer.from(frameBase64.split(',')[1], 'base64');
+      const processedImage = await sharp(buffer)
+        .resize({ width: 320, height: 240, fit: 'inside' })
+        .jpeg({ quality: 70 })
+        .toBuffer();
+      
+      // Convert back to base64
+      const processedBase64 = `data:image/jpeg;base64,${processedImage.toString('base64')}`;
+      
+      // Moderate the frame
+      const mod = await OPENAI.moderations.create({ 
+        model: "omni-moderation-latest", 
+        input: processedBase64 
+      });
+      
+      const flagged = mod.results?.[0]?.categories?.sexual || 
+                    mod.results?.[0]?.categories?.hate || 
+                    mod.results?.[0]?.categories?.violence || 
+                    mod.results?.[0]?.flagged;
+      
+      if (flagged) {
+        const banReason = `Inappropriate video content: ${mod.results[0].category_scores}`;
+        await pool.query(
+          "UPDATE users SET banned_until = NOW() + INTERVAL '750 hours', ban_reason=$1 WHERE id=$2",
+          [banReason, uid]
+        );
+        
+        socket.emit("moderation_action", { 
+          type: "video", 
+          banned: true, 
+          duration_hours: BAN_HOURS,
+          reason: banReason
+        });
+        
+        // Log the ban
+        await pool.query(
+          "INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())",
+          [uid, "auto_ban", banReason]
+        );
+        
+        socket.disconnect(true);
+        return;
+      }
+      
+      // Forward frame to the other user in the room
+      const targetRoom = roomId || userRoom[0];
+      const participants = roomParticipants.get(targetRoom) || [];
+      const otherUserId = participants.find(id => id !== uid);
+      
+      if (otherUserId) {
+        const otherSocketId = onlineSockets.get(String(otherUserId));
+        if (otherSocketId) {
+          io.to(otherSocketId).emit("video_frame", { 
+            frameBase64: processedBase64,
+            from: uid
+          });
+        }
+      }
+    } catch (err) { 
+      console.error("Video moderation error:", err); 
+    }
+  });
 
-  } catch (err) {
-    logger.error("Advanced trending error", err);
-    res.status(500).json({ error: "Server error" });
+  socket.on("join_room", async ({ room }) => {
+    if (!room) return;
+    
+    const uid = requireSocketUser(socket);
+    if (!uid) return;
+    
+    try {
+      // Check if user is already in a room
+      const currentRooms = userRooms.get(uid) || [];
+      if (currentRooms.length > 0) {
+        // Leave current rooms
+        currentRooms.forEach(r => {
+          socket.leave(r);
+          socket.to(r).emit("peer_left", { socketId: socket.id, userId: uid });
+          
+          // Update room participants
+          const participants = roomParticipants.get(r);
+          if (participants) {
+            const index = participants.indexOf(uid);
+            if (index > -1) {
+              participants.splice(index, 1);
+              roomParticipants.set(r, participants);
+            }
+          }
+        });
+      }
+      
+      // Join new room
+      socket.join(room);
+      
+      // Update user rooms
+      userRooms.set(uid, [room]);
+      
+      // Update room participants
+      const participants = roomParticipants.get(room) || [];
+      participants.push(uid);
+      roomParticipants.set(room, participants);
+      
+      // Notify other participants
+      socket.to(room).emit("peer_joined", { 
+        socketId: socket.id, 
+        userId: uid,
+        username: socket.data.user.username
+      });
+      
+      // Get existing messages for this room
+      const { rows } = await pool.query(
+        "SELECT * FROM chat_messages WHERE room_id=$1 ORDER BY created_at DESC LIMIT 50",
+        [room]
+      );
+      
+      // Send recent messages to the user
+      socket.emit("room_history", {
+        messages: rows.reverse().map(msg => ({
+          id: msg.id,
+          uid: msg.user_id,
+          message: msg.message,
+          timestamp: msg.created_at
+        }))
+      });
+      
+      // Log room join
+      await pool.query(
+        "INSERT INTO room_activity (user_id, room_id, action, created_at) VALUES ($1, $2, $3, NOW())",
+        [uid, room, "join"]
+      );
+    } catch (err) {
+      console.error("Error joining room:", err);
+      socket.emit("error", { message: "Failed to join room" });
+    }
+  });
+
+  socket.on("leave_room", async ({ room }) => {
+    if (!room) return;
+    
+    const uid = requireSocketUser(socket);
+    if (!uid) return;
+    
+    try {
+      socket.leave(room);
+      
+      // Update user rooms
+      const currentRooms = userRooms.get(uid) || [];
+      const index = currentRooms.indexOf(room);
+      if (index > -1) {
+        currentRooms.splice(index, 1);
+        userRooms.set(uid, currentRooms);
+      }
+      
+      // Update room participants
+      const participants = roomParticipants.get(room) || [];
+      const participantIndex = participants.indexOf(uid);
+      if (participantIndex > -1) {
+        participants.splice(participantIndex, 1);
+        roomParticipants.set(room, participants);
+      }
+      
+      // Notify other participants
+      socket.to(room).emit("peer_left", { socketId: socket.id, userId: uid });
+      
+      // Log room leave
+      await pool.query(
+        "INSERT INTO room_activity (user_id, room_id, action, created_at) VALUES ($1, $2, $3, NOW())",
+        [uid, room, "leave"]
+      );
+    } catch (err) {
+      console.error("Error leaving room:", err);
+      socket.emit("error", { message: "Failed to leave room" });
+    }
+  });
+
+  socket.on("report_user", async ({ reportedUserId, reason, roomId }) => {
+    const uid = requireSocketUser(socket);
+    if (!uid) return;
+    
+    try {
+      // Validate reason
+      if (!reason || reason.length < 10 || reason.length > 200) {
+        socket.emit("error", { message: "Invalid report reason" });
+        return;
+      }
+      
+      // Check if user is in a room with the reported user
+      const userRoom = userRooms.get(uid);
+      const reportedUserRoom = userRooms.get(reportedUserId);
+      
+      if (!userRoom || !reportedUserRoom || !userRoom.some(r => reportedUserRoom.includes(r))) {
+        socket.emit("error", { message: "You can only report users in the same room" });
+        return;
+      }
+      
+      // Check if user already reported this user in the last 24 hours
+      const { rows } = await pool.query(
+        `SELECT COUNT(*) as count FROM user_reports 
+         WHERE reporter_id=$1 AND reported_id=$2 AND created_at > NOW() - INTERVAL '24 hours'`,
+        [uid, reportedUserId]
+      );
+      
+      if (parseInt(rows[0].count) > 0) {
+        socket.emit("error", { message: "You already reported this user recently" });
+        return;
+      }
+      
+      // Save report
+      await pool.query(
+        "INSERT INTO user_reports (reporter_id, reported_id, reason, room_id, created_at) VALUES ($1, $2, $3, $4, NOW())",
+        [uid, reportedUserId, reason, roomId]
+      );
+      
+      // Check if user has been reported multiple times
+      const { rows: reportCount } = await pool.query(
+        `SELECT COUNT(*) as count FROM user_reports 
+         WHERE reported_id=$1 AND created_at > NOW() - INTERVAL '24 hours'`,
+        [reportedUserId]
+      );
+      
+      // If user has been reported 3+ times in 24 hours, auto-ban
+      if (parseInt(reportCount[0].count) >= 3) {
+        await pool.query(
+          "UPDATE users SET banned_until = NOW() + INTERVAL '168 hours', ban_reason=$1 WHERE id=$2",
+          ["Multiple user reports", reportedUserId]
+        );
+        
+        // Notify the reported user
+        const reportedSocketId = onlineSockets.get(String(reportedUserId));
+        if (reportedSocketId) {
+          io.to(reportedSocketId).emit("banned", { 
+            reason: "Multiple user reports", 
+            until: new Date(Date.now() + 168 * 60 * 60 * 1000),
+            canAppeal: true
+          });
+          
+          // Disconnect the user
+          io.sockets.sockets.get(reportedSocketId)?.disconnect(true);
+        }
+      }
+      
+      socket.emit("report_submitted", { message: "Report submitted successfully" });
+    } catch (err) {
+      console.error("Error reporting user:", err);
+      socket.emit("error", { message: "Failed to submit report" });
+    }
+  });
+
+  socket.on("webrtc.offer", ({ room, sdp }) => { 
+    if (!room || !sdp) return; 
+    socket.to(room).emit("webrtc.offer", { from: socket.id, sdp }); 
+  });
+  
+  socket.on("webrtc.answer", ({ room, sdp }) => { 
+    if (!room || !sdp) return; 
+    socket.to(room).emit("webrtc.answer", { from: socket.id, sdp }); 
+  });
+  
+  socket.on("webrtc.ice", ({ room, candidate }) => { 
+    if (!room || !candidate) return; 
+    socket.to(room).emit("webrtc.ice", { from: socket.id, candidate }); 
+  });
+});
+
+// ------------------- MATCHMAKING -------------------
+async function tryFindMatch(userId, genderPref, locationPref, interests = []) {
+  const candidateQuery = `
+    SELECT q.user_id, q.gender, q.location, q.interests, q.nickname, u.username, u.avatar
+    FROM queue q
+    JOIN users u ON q.user_id = u.id
+    WHERE q.user_id <> $1
+      AND ($2='any' OR q.gender=$2)
+      AND ($3='any' OR q.location=$3)
+      AND u.banned_until IS NULL OR u.banned_until < NOW()
+    ORDER BY 
+      CASE WHEN $4::text[] && q.interests THEN 1 ELSE 2 END,
+      joined_at ASC 
+    LIMIT 1`;
+    
+  const { rows } = await pool.query(candidateQuery, [userId, genderPref, locationPref, interests]);
+  if (!rows.length) return null;
+
+  const peerId = rows[0].user_id;
+  const channelName = `omevo_${Math.min(Number(userId), Number(peerId))}_${Math.max(Number(userId), Number(peerId))}_${Date.now()}`;
+
+  await pool.query(`INSERT INTO matches (user_a, user_b, channel_name, created_at) VALUES ($1,$2,$3,NOW())`, [userId, peerId, channelName]);
+  await pool.query("DELETE FROM queue WHERE user_id = ANY($1::text[])", [[userId, peerId]]).catch(() => {});
+
+  const peerSocketId = onlineSockets.get(String(peerId));
+  if (peerSocketId) {
+    io.to(peerSocketId).emit("match_found", { 
+      peerId: userId, 
+      channel: channelName,
+      peerInfo: {
+        username: rows[0].username,
+        nickname: rows[0].nickname,
+        avatar: rows[0].avatar,
+        gender: rows[0].gender,
+        location: rows[0].location,
+        interests: rows[0].interests
+      }
+    });
+  }
+
+  const requesterSocketId = onlineSockets.get(String(userId));
+  if (requesterSocketId) {
+    // Get user info for the requester
+    const { rows: requesterRows } = await pool.query(
+      "SELECT username, nickname, avatar, gender, location, interests FROM users u JOIN queue q ON u.id = q.user_id WHERE u.id = $1",
+      [userId]
+    );
+    
+    io.to(requesterSocketId).emit("match_found", { 
+      peerId, 
+      channel: channelName,
+      peerInfo: {
+        username: requesterRows[0]?.username,
+        nickname: requesterRows[0]?.nickname,
+        avatar: requesterRows[0]?.avatar,
+        gender: requesterRows[0]?.gender,
+        location: requesterRows[0]?.location,
+        interests: requesterRows[0]?.interests
+      }
+    });
+  }
+
+  return { peerId, channel: channelName };
+}
+
+// ------------------- USER PREFERENCES -------------------
+app.get("/api/user/preferences", requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT gender, location, interests, age_verified FROM users WHERE id = $1", [req.user.id]);
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+    res.json(rows[0]);
+  } catch (err) { 
+    console.error(err); 
+    res.status(500).json({ error: "Could not fetch preferences" }); 
   }
 });
 
-// Error handling
-app.use((err, req, res, next) => {
-  logger.error("Unhandled error", err);
-  res.status(500).json({ error: "Internal server error" });
+app.post("/api/user/preferences", requireAuth, async (req, res) => {
+  try {
+    let { gender = "any", location = "any", interests = [], nickname = "" } = req.body;
+    
+    // Validate inputs
+    if (nickname && (nickname.length > MAX_NICKNAME_LENGTH || nickname.length < 1)) {
+      return res.status(400).json({ error: `Nickname must be between 1 and ${MAX_NICKNAME_LENGTH} characters` });
+    }
+    
+    if (!Array.isArray(interests) || interests.length > MAX_INTERESTS) {
+      return res.status(400).json({ error: `You can have up to ${MAX_INTERESTS} interests` });
+    }
+    
+    // Filter out invalid interests
+    interests = interests.filter(interest => 
+      typeof interest === 'string' && interest.length > 0 && interest.length <= 30
+    );
+    
+    const userId = String(req.user.id);
+
+    if (!location || location === "any") {
+      const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress;
+      const geo = geoip.lookup(ip);
+      location = geo?.country?.toLowerCase() || "any";
+    }
+
+    if (req.user.banned_until && new Date(req.user.banned_until) > new Date()) {
+      return res.status(403).json({ error: "Account banned" });
+    }
+
+    await pool.query(
+      `UPDATE users 
+       SET gender=$1, location=$2, interests=$3, nickname=$4, updated_at=NOW()
+       WHERE id=$5`,
+      [gender || "any", location || "any", interests, nickname || "", userId]
+    );
+
+    // Update cache
+    const updatedUser = { ...req.user, gender, location, interests, nickname };
+    userCache.set(`user:${userId}`, updatedUser);
+
+    res.json({ ok: true, locationUsed: location });
+  } catch (err) { 
+    console.error(err); 
+    res.status(500).json({ error: "Could not save preferences" }); 
+  }
 });
 
-// Start server
-const _PORT = Number(PORT || 5000);
-app.listen(_PORT, () => logger.info(`Server running on port ${_PORT}`));
+// ------------------- AGE VERIFICATION -------------------
+app.post("/api/user/verify-age", requireAuth, async (req, res) => {
+  try {
+    const { age } = req.body;
+    
+    if (!age || isNaN(age)) {
+      return res.status(400).json({ error: "Valid age required" });
+    }
+    
+    if (age < MIN_AGE_FOR_VIDEO) {
+      return res.status(400).json({ error: `You must be at least ${MIN_AGE_FOR_VIDEO} to use video features` });
+    }
+    
+    await pool.query(
+      "UPDATE users SET age_verified=$1, updated_at=NOW() WHERE id=$2",
+      [true, req.user.id]
+    );
+    
+    // Update cache
+    const updatedUser = { ...req.user, age_verified: true };
+    userCache.set(`user:${req.user.id}`, updatedUser);
+    
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Age verification failed:", err);
+    res.status(500).json({ error: "Could not verify age" });
+  }
+});
+
+// ------------------- QUEUE HANDLERS -------------------
+app.post("/queue/enqueue", requireAuth, async (req, res) => {
+  try {
+    let { gender = "any", location = "any", interests = [], nickname = "" } = req.body;
+    const userId = String(req.user.id);
+
+    // Check if user is already in a match
+    const { rows: activeMatch } = await pool.query(
+      "SELECT * FROM matches WHERE (user_a=$1 OR user_b=$1) AND ended_at IS NULL",
+      [userId]
+    );
+    
+    if (activeMatch.length > 0) {
+      return res.status(400).json({ error: "You're already in a match" });
+    }
+
+    if (!location || location === "any") {
+      const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress;
+      const geo = geoip.lookup(ip);
+      location = geo?.country?.toLowerCase() || "any";
+    }
+
+    if (req.user.banned_until && new Date(req.user.banned_until) > new Date()) {
+      return res.status(403).json({ error: "Account banned" });
+    }
+    
+    // Check if user is age verified for video
+    if (!req.user.age_verified) {
+      return res.status(403).json({ error: "Age verification required for video features" });
+    }
+
+    // Validate inputs
+    if (nickname && (nickname.length > MAX_NICKNAME_LENGTH || nickname.length < 1)) {
+      return res.status(400).json({ error: `Nickname must be between 1 and ${MAX_NICKNAME_LENGTH} characters` });
+    }
+    
+    if (!Array.isArray(interests) || interests.length > MAX_INTERESTS) {
+      return res.status(400).json({ error: `You can have up to ${MAX_INTERESTS} interests` });
+    }
+    
+    // Filter out invalid interests
+    interests = interests.filter(interest => 
+      typeof interest === 'string' && interest.length > 0 && interest.length <= 30
+    );
+
+    await pool.query(
+      `INSERT INTO queue (user_id, gender, location, interests, nickname, joined_at)
+       VALUES ($1,$2,$3,$4,$5,NOW())
+       ON CONFLICT (user_id) DO UPDATE SET gender=EXCLUDED.gender,
+         location=EXCLUDED.location, interests=EXCLUDED.interests,
+         nickname=EXCLUDED.nickname, joined_at=NOW()`,
+      [userId, gender || "any", location || "any", interests, nickname]
+    );
+
+    const match = await tryFindMatch(userId, gender || "any", location || "any", interests);
+    if (match) return res.json({ matched: true, peerId: match.peerId, channel: match.channel });
+
+    return res.json({ matched: false, locationUsed: location });
+  } catch (err) { 
+    console.error(err); 
+    res.status(500).json({ error: "enqueue failed" }); 
+  }
+});
+
+app.post("/queue/leave", requireAuth, async (req, res) => {
+  try { 
+    await pool.query("DELETE FROM queue WHERE user_id=$1", [String(req.user.id)]); 
+    return res.json({ ok: true }); 
+  } catch (err) { 
+    console.error(err); 
+    res.status(500).json({ error: "leave failed" }); 
+  }
+});
+
+// ------------------- AGORA TOKEN GENERATION -------------------
+const { RtcTokenBuilder, RtcRole, RtmTokenBuilder } = agora;
+
+app.post("/generateToken", requireAuth, async (req, res) => {
+  try {
+    const { channelName, uid: requestedUid, role = "publisher", expirySeconds = 3600 } = req.body;
+    if (!channelName) return res.status(400).json({ error: "channelName required" });
+
+    const uid = requestedUid !== undefined ? String(requestedUid) : String(req.user.id);
+    const rtcRole = role === "publisher" ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER;
+
+    const currentTimestamp = Math.floor(Date.now() / 1000);
+    const privilegeExpiredTs = currentTimestamp + Number(expirySeconds);
+
+    const rtcToken = RtcTokenBuilder.buildTokenWithAccount(
+      AGORA_APP_ID,
+      AGORA_APP_CERTIFICATE,
+      channelName,
+      uid,
+      rtcRole,
+      privilegeExpiredTs
+    );
+    const rtmToken = RtmTokenBuilder.buildToken(AGORA_APP_ID, AGORA_APP_CERTIFICATE, uid, privilegeExpiredTs);
+
+    return res.json({ rtcToken, rtmToken, appID: AGORA_APP_ID, uid });
+  } catch (err) { 
+    console.error(err); 
+    res.status(500).json({ error: "token generation failed" }); 
+  }
+});
+
+app.post("/user/display-name", requireAuth, async (req, res) => {
+  try {
+    const { display_name } = req.body;
+
+    if (!display_name || display_name.length > MAX_NICKNAME_LENGTH) {
+      return res.status(400).json({ error: `Display name must be between 1 and ${MAX_NICKNAME_LENGTH} characters` });
+    }
+
+    // Check for profanity
+    const mod = await OPENAI.moderations.create({ 
+      model: "omni-moderation-latest", 
+      input: display_name 
+    });
+    
+    if (mod.results?.[0]?.flagged) {
+      return res.status(400).json({ error: "Display name contains inappropriate content" });
+    }
+
+    await pool.query(
+      "UPDATE users SET username=$1, updated_at=NOW() WHERE id=$2",
+      [display_name, req.user.id]
+    );
+
+    // Update cache
+    const updatedUser = { ...req.user, username: display_name };
+    userCache.set(`user:${req.user.id}`, updatedUser);
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Display name update failed:", err);
+    res.status(500).json({ error: "Could not update name" });
+  }
+});
+
+// ------------------- USER PROFILE -------------------
+app.get("/api/user/profile", requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, username, email, provider, avatar, gender, location, interests, 
+       nickname, age_verified, created_at, updated_at 
+       FROM users WHERE id = $1`,
+      [req.user.id]
+    );
+    
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+    
+    // Get user stats
+    const { rows: stats } = await pool.query(
+      `SELECT 
+       (SELECT COUNT(*) FROM matches WHERE user_a=$1 OR user_b=$1) as total_matches,
+       (SELECT COUNT(*) FROM user_reports WHERE reporter_id=$1) as reports_filed,
+       (SELECT COUNT(*) FROM user_reports WHERE reported_id=$1) as reports_received`,
+      [req.user.id]
+    );
+    
+    const profile = {
+      ...rows[0],
+      stats: stats[0]
+    };
+    
+    res.json(profile);
+  } catch (err) {
+    console.error("Profile fetch failed:", err);
+    res.status(500).json({ error: "Could not fetch profile" });
+  }
+});
+
+// ------------------- AVATAR UPLOAD -------------------
+app.post("/api/user/avatar", requireAuth, async (req, res) => {
+  try {
+    const { avatarBase64 } = req.body;
+    
+    if (!avatarBase64) {
+      return res.status(400).json({ error: "Avatar image required" });
+    }
+    
+    // Process and validate image
+    const buffer = Buffer.from(avatarBase64.split(',')[1], 'base64');
+    const metadata = await sharp(buffer).metadata();
+    
+    // Check image size and format
+    if (metadata.width > 500 || metadata.height > 500) {
+      return res.status(400).json({ error: "Avatar must be at most 500x500 pixels" });
+    }
+    
+    if (!['jpeg', 'jpg', 'png', 'webp'].includes(metadata.format)) {
+      return res.status(400).json({ error: "Avatar must be in JPEG, PNG, or WebP format" });
+    }
+    
+    // Moderate the avatar
+    const mod = await OPENAI.moderations.create({ 
+      model: "omni-moderation-latest", 
+      input: avatarBase64 
+    });
+    
+    if (mod.results?.[0]?.flagged) {
+      return res.status(400).json({ error: "Avatar contains inappropriate content" });
+    }
+    
+    // Resize and optimize the image
+    const processedImage = await sharp(buffer)
+      .resize({ width: 200, height: 200, fit: 'cover' })
+      .jpeg({ quality: 80 })
+      .toBuffer();
+    
+    // Convert to base64
+    const processedBase64 = `data:image/jpeg;base64,${processedImage.toString('base64')}`;
+    
+    // Generate a unique filename
+    const filename = `avatar_${req.user.id}_${Date.now()}.jpg`;
+    
+    // Update user avatar in database
+    await pool.query(
+      "UPDATE users SET avatar=$1, updated_at=NOW() WHERE id=$2",
+      [processedBase64, req.user.id]
+    );
+    
+    // Update cache
+    const updatedUser = { ...req.user, avatar: processedBase64 };
+    userCache.set(`user:${req.user.id}`, updatedUser);
+    
+    res.json({ ok: true, avatar: processedBase64 });
+  } catch (err) {
+    console.error("Avatar upload failed:", err);
+    res.status(500).json({ error: "Could not upload avatar" });
+  }
+});
+
+// ------------------- BAN PAYMENT (Coinbase Commerce) -------------------
+app.post("/api/pay-unban", async (req, res) => {
+  try {
+    const { userId } = req.body;
+    
+    // Validate user exists and is banned
+    const { rows } = await pool.query(
+      "SELECT * FROM users WHERE id=$1 AND banned_until > NOW()",
+      [userId]
+    );
+    
+    if (!rows.length) {
+      return res.status(400).json({ error: "User not found or not banned" });
+    }
+    
+    const chargeData = {
+      name: "Ban Removal",
+      description: "Remove your account suspension",
+      local_price: { amount: UNBAN_PRICE.toFixed(2), currency: "USD" },
+      pricing_type: "fixed_price",
+      metadata: { userId: String(userId) },
+      redirect_url: `${process.env.FRONTEND_URL}/unban-success?userId=${userId}`,
+      cancel_url: `${process.env.FRONTEND_URL}/unban-cancel`,
+    };
+    
+    const charge = await Charge.create(chargeData);
+    res.json({ url: charge.hosted_url });
+  } catch (err) { 
+    console.error(err); 
+    res.status(500).json({ error: "Coinbase payment creation failed" }); 
+  }
+});
+
+// Coinbase Webhook
+app.post("/api/coinbase-webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  const signature = req.headers["x-cc-webhook-signature"];
+  try {
+    const event = CoinbaseCommerce.Webhook.verifyEventBody(req.body.toString(), signature, process.env.COINBASE_COMMERCE_WEBHOOK_SECRET);
+
+    if (event.type === "charge:confirmed" || event.type === "charge:resolved") {
+      const userId = event.data.metadata?.userId;
+      if (userId) {
+        await pool.query("UPDATE users SET banned_until=NULL, ban_reason=NULL WHERE id=$1", [userId]);
+        
+        // Log the unban
+        await pool.query(
+          "INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())",
+          [userId, "paid_unban", "User paid for unban"]
+        );
+        
+        console.log(`✅ User ${userId} unbanned via Coinbase payment`);
+        
+        // Invalidate cache
+        userCache.del(`user:${userId}`);
+      }
+    }
+
+    res.status(200).json({ received: true });
+  } catch (err) {
+    console.error("Coinbase webhook error:", err);
+    res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+});
+
+// ------------------- MODERATION APPEAL -------------------
+app.post("/api/moderation/appeal", requireAuth, async (req, res) => {
+  try {
+    const { message } = req.body;
+    
+    if (!message || message.length < 10 || message.length > 500) {
+      return res.status(400).json({ error: "Appeal message must be between 10 and 500 characters" });
+    }
+    
+    // Check if user already has a pending appeal
+    const { rows } = await pool.query(
+      "SELECT * FROM appeals WHERE user_id=$1 AND status='pending'",
+      [req.user.id]
+    );
+    
+    if (rows.length > 0) {
+      return res.status(400).json({ error: "You already have a pending appeal" });
+    }
+    
+    await pool.query(
+      "INSERT INTO appeals (user_id, message, status, created_at) VALUES ($1, $2, 'pending', NOW())",
+      [req.user.id, message]
+    );
+    
+    res.json({ ok: true, message: "Appeal submitted successfully" });
+  } catch (err) {
+    console.error("Appeal failed:", err);
+    res.status(500).json({ error: "Could not submit appeal" });
+  }
+});
+
+// ------------------- ADMIN APPEALS -------------------
+app.get("/api/admin/appeals", requireAuth, async (req, res) => {
+  try {
+    // Check if user is admin
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: "Admin access required" });
+    }
+    
+    const { rows } = await pool.query(
+      `SELECT a.*, u.username, u.email 
+       FROM appeals a 
+       JOIN users u ON a.user_id = u.id 
+       WHERE a.status='pending' 
+       ORDER BY a.created_at DESC`
+    );
+    
+    res.json(rows);
+  } catch (err) {
+    console.error("Failed to fetch appeals:", err);
+    res.status(500).json({ error: "Could not fetch appeals" });
+  }
+});
+
+app.post("/api/admin/appeals/:id/respond", requireAuth, async (req, res) => {
+  try {
+    // Check if user is admin
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: "Admin access required" });
+    }
+    
+    const { id } = req.params;
+    const { approved, response } = req.body;
+    
+    if (approved === undefined) {
+      return res.status(400).json({ error: "Approval status required" });
+    }
+    
+    // Get appeal details
+    const { rows } = await pool.query(
+      "SELECT * FROM appeals WHERE id=$1",
+      [id]
+    );
+    
+    if (!rows.length) {
+      return res.status(404).json({ error: "Appeal not found" });
+    }
+    
+    const appeal = rows[0];
+    
+    // Update appeal status
+    await pool.query(
+      "UPDATE appeals SET status=$1, admin_response=$2, admin_id=$3, reviewed_at=NOW() WHERE id=$4",
+      [approved ? 'approved' : 'rejected', response, req.user.id, id]
+    );
+    
+    // If approved, unban the user
+    if (approved) {
+      await pool.query("UPDATE users SET banned_until=NULL, ban_reason=NULL WHERE id=$1", [appeal.user_id]);
+      
+      // Log the unban
+      await pool.query(
+        "INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())",
+        [appeal.user_id, "appeal_approved", "Appeal approved by admin"]
+      );
+      
+      // Invalidate cache
+      userCache.del(`user:${appeal.user_id}`);
+    }
+    
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Failed to respond to appeal:", err);
+    res.status(500).json({ error: "Could not respond to appeal" });
+  }
+});
+
+// ------------------- MATCH HISTORY -------------------
+app.get("/api/user/match-history", requireAuth, async (req, res) => {
+  try {
+    const { page = 1, limit = 10 } = req.query;
+    const offset = (page - 1) * limit;
+    
+    const { rows } = await pool.query(
+      `SELECT m.*, 
+       CASE WHEN m.user_a = $1 THEN m.user_b ELSE m.user_a END as partner_id,
+       u.username as partner_username,
+       u.avatar as partner_avatar
+       FROM matches m
+       JOIN users u ON (CASE WHEN m.user_a = $1 THEN m.user_b ELSE m.user_a END) = u.id
+       WHERE (m.user_a = $1 OR m.user_b = $1)
+       ORDER BY m.created_at DESC
+       LIMIT $2 OFFSET $3`,
+      [req.user.id, limit, offset]
+    );
+    
+    // Get total count for pagination
+    const { rows: countRows } = await pool.query(
+      "SELECT COUNT(*) as total FROM matches WHERE user_a = $1 OR user_b = $1",
+      [req.user.id]
+    );
+    
+    res.json({
+      matches: rows,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: parseInt(countRows[0].total),
+        pages: Math.ceil(countRows[0].total / limit)
+      }
+    });
+  } catch (err) {
+    console.error("Failed to fetch match history:", err);
+    res.status(500).json({ error: "Could not fetch match history" });
+  }
+});
+
+// ------------------- HEALTH CHECK -------------------
+app.get("/health", (req, res) => {
+  res.json({ 
+    ok: true, 
+    env: process.env.NODE_ENV || "dev",
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
+});
+
+// ------------------- SCHEDULED TASKS -------------------
+// Clean up old data daily at 3 AM
+cron.schedule("0 3 * * *", async () => {
+  try {
+    console.log("Running daily cleanup task");
+    
+    // Delete old chat messages (older than 30 days)
+    await pool.query("DELETE FROM chat_messages WHERE created_at < NOW() - INTERVAL '30 days'");
+    
+    // Delete old user activity logs (older than 90 days)
+    await pool.query("DELETE FROM user_activity WHERE created_at < NOW() - INTERVAL '90 days'");
+    
+    // Delete resolved appeals (older than 180 days)
+    await pool.query("DELETE FROM appeals WHERE status IN ('approved', 'rejected') AND reviewed_at < NOW() - INTERVAL '180 days'");
+    
+    console.log("Daily cleanup task completed");
+  } catch (err) {
+    console.error("Error in daily cleanup task:", err);
+  }
+});
+
+// ------------------- START SERVER -------------------
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
