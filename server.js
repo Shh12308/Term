@@ -826,6 +826,173 @@ io.on("connection", (socket) => {
     }
   });
 
+  // Add these routes to your backend server
+
+// Create Stripe Checkout Session
+app.post('/api/create-checkout-session', requireAuth, async (req, res) => {
+  try {
+    const { coins, price } = req.body;
+    
+    // Initialize Stripe
+    const stripe = require('stripe')('sk_test_51234567890abcdef'); // Replace with your Stripe secret key
+    
+    // Create checkout session
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [{
+        price_data: {
+          currency: 'usd',
+          product_data: {
+            name: `${coins} ChatVibe Coins`,
+            description: `Purchase ${coins} coins for sending virtual gifts`,
+            images: ['https://your-domain.com/coins-image.png']
+          },
+          unit_amount: Math.round(price * 100) // Convert to cents
+        },
+        quantity: 1
+      }],
+      mode: 'payment',
+      success_url: `${process.env.FRONTEND_URL}?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_URL}?payment=cancelled`,
+      customer_email: req.user.email,
+      metadata: {
+        userId: req.user.id,
+        coins: coins.toString()
+      }
+    });
+    
+    res.json({ sessionId: session.id });
+  } catch (error) {
+    console.error('Error creating checkout session:', error);
+    res.status(500).json({ error: 'Failed to create payment session' });
+  }
+});
+
+// Verify Payment and Update Coins
+app.post('/api/verify-payment', requireAuth, async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    
+    // Initialize Stripe
+    const stripe = require('stripe')('sk_test_51234567890abcdef'); // Replace with your Stripe secret key
+    
+    // Retrieve the session
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    
+    if (session.payment_status === 'paid') {
+      const coins = parseInt(session.metadata.coins);
+      const userId = session.metadata.userId;
+      
+      // Update user's coin balance
+      await pool.query(
+        'UPDATE users SET coins = coins + $1, updated_at = NOW() WHERE id = $2',
+        [coins, userId]
+      );
+      
+      // Get updated user data
+      const { rows } = await pool.query('SELECT coins FROM users WHERE id = $1', [userId]);
+      
+      // Log transaction
+      await pool.query(
+        'INSERT INTO coin_transactions (user_id, coins, amount, transaction_id, created_at) VALUES ($1, $2, $3, $4, NOW())',
+        [userId, coins, session.amount_total / 100, sessionId]
+      );
+      
+      res.json({ 
+        success: true, 
+        coins: rows[0].coins 
+      });
+    } else {
+      res.json({ success: false });
+    }
+  } catch (error) {
+    console.error('Error verifying payment:', error);
+    res.status(500).json({ error: 'Failed to verify payment' });
+  }
+});
+
+// Add coins column to users table if not exists
+async function ensureCoinsColumn() {
+  try {
+    await pool.query(`
+      ALTER TABLE users 
+      ADD COLUMN IF NOT EXISTS coins INTEGER DEFAULT 0
+    `);
+    
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS coin_transactions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id),
+        coins INTEGER NOT NULL,
+        amount DECIMAL(10,2) NOT NULL,
+        transaction_id VARCHAR(255),
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+  } catch (error) {
+    console.error('Error ensuring coins column:', error);
+  }
+}
+
+// Call this when server starts
+ensureCoinsColumn();
+
+// Update user profile endpoint to include coins
+app.get('/user/profile', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, username, email, provider, avatar, gender, location, interests, 
+       nickname, age_verified, created_at, updated_at, coins
+       FROM users WHERE id = $1`,
+      [req.user.id]
+    );
+    
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+    
+    const profile = {
+      ...rows[0],
+      display_name: rows[0].username,
+      is_admin: rows[0].role === 'admin'
+    };
+    
+    res.json(profile);
+  } catch (err) {
+    console.error("Profile fetch failed:", err);
+    res.status(500).json({ error: "Could not fetch profile" });
+  }
+});
+
+// Spend coins endpoint
+app.post('/api/user/spend-coins', requireAuth, async (req, res) => {
+  try {
+    const { coins, type, giftType, recipientId } = req.body;
+    
+    // Check if user has enough coins
+    const { rows } = await pool.query('SELECT coins FROM users WHERE id = $1', [req.user.id]);
+    
+    if (rows[0].coins < coins) {
+      return res.status(400).json({ error: 'Insufficient coins' });
+    }
+    
+    // Deduct coins
+    await pool.query(
+      'UPDATE users SET coins = coins - $1, updated_at = NOW() WHERE id = $2',
+      [coins, req.user.id]
+    );
+    
+    // Log transaction
+    await pool.query(
+      'INSERT INTO coin_transactions (user_id, coins, amount, transaction_type, gift_type, recipient_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, NOW())',
+      [req.user.id, -coins, 0, type, giftType, recipientId]
+    );
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error spending coins:', error);
+    res.status(500).json({ error: 'Failed to spend coins' });
+  }
+});
+
   socket.on("report_user", async ({ reportedUserId, reason, roomId }) => {
     const uid = requireSocketUser(socket);
     if (!uid) return;
