@@ -418,7 +418,7 @@ io.on("connection", (socket) => {
           socket.leave(room);
           
           // Notify other participants
-          socket.to(room).emit("peer_left", { socketId: socket.id, userId: uid });
+          socket.to(room).emit("partner-left", { socketId: socket.id, userId: uid });
           
           // Update room participants
           const participants = roomParticipants.get(room);
@@ -441,31 +441,105 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("chat_message", async ({ message, roomId }) => {
+  // Updated to match frontend
+  socket.on("join", async ({ room, uid, name }) => {
+    if (!room) return;
+    
+    const userId = requireSocketUser(socket);
+    if (!userId) return;
+    
+    try {
+      // Check if user is already in a room
+      const currentRooms = userRooms.get(userId) || [];
+      if (currentRooms.length > 0) {
+        // Leave current rooms
+        currentRooms.forEach(r => {
+          socket.leave(r);
+          socket.to(r).emit("partner-left", { socketId: socket.id, userId });
+          
+          // Update room participants
+          const participants = roomParticipants.get(r);
+          if (participants) {
+            const index = participants.indexOf(userId);
+            if (index > -1) {
+              participants.splice(index, 1);
+              roomParticipants.set(r, participants);
+            }
+          }
+        });
+      }
+      
+      // Join new room
+      socket.join(room);
+      
+      // Update user rooms
+      userRooms.set(userId, [room]);
+      
+      // Update room participants
+      const participants = roomParticipants.get(room) || [];
+      participants.push(userId);
+      roomParticipants.set(room, participants);
+      
+      // Notify other participants
+      socket.to(room).emit("peer_joined", { 
+        socketId: socket.id, 
+        userId,
+        username: name || socket.data.user.username
+      });
+      
+      // Get existing messages for this room
+      const { rows } = await pool.query(
+        "SELECT * FROM chat_messages WHERE room_id=$1 ORDER BY created_at DESC LIMIT 50",
+        [room]
+      );
+      
+      // Send recent messages to the user
+      socket.emit("room_history", {
+        messages: rows.reverse().map(msg => ({
+          id: msg.id,
+          uid: msg.user_id,
+          message: msg.message,
+          timestamp: msg.created_at
+        }))
+      });
+      
+      // Log room join
+      await pool.query(
+        "INSERT INTO room_activity (user_id, room_id, action, created_at) VALUES ($1, $2, $3, NOW())",
+        [userId, room, "join"]
+      );
+    } catch (err) {
+      console.error("Error joining room:", err);
+      socket.emit("error", { message: "Failed to join room" });
+    }
+  });
+
+  // Updated to match frontend
+  socket.on("message", async ({ room, text }) => {
     const uid = requireSocketUser(socket);
     if (!uid) return;
     
     try {
       // Check if user is in a room
       const userRoom = userRooms.get(uid);
-      if (!userRoom || (roomId && !userRoom.includes(roomId))) {
+      if (!userRoom || (room && !userRoom.includes(room))) {
         socket.emit("error", { message: "You're not in this room" });
         return;
       }
       
       // Check message length
-      if (message.length > 500) {
+      if (text.length > 500) {
         socket.emit("error", { message: "Message too long" });
         return;
       }
       
       // Detect suspicious behavior
-      await detectSuspiciousBehavior(uid, "chat_message", { length: message.length });
+      await detectSuspiciousBehavior(uid, "chat_message", { length: text.length });
       
       // Moderate the message
       const mod = await OPENAI.moderations.create({ 
         model: "omni-moderation-latest", 
-        input: message 
+        input: text 
       });
       
       const flagged = mod.results?.[0]?.categories?.sexual || 
@@ -482,7 +556,7 @@ io.on("connection", (socket) => {
         
         socket.emit("moderation_action", { 
           type: "chat", 
-          message, 
+          text, 
           banned: true, 
           duration_hours: BAN_HOURS,
           reason: banReason
@@ -501,26 +575,60 @@ io.on("connection", (socket) => {
       // Save message to database
       const { rows } = await pool.query(
         "INSERT INTO chat_messages (user_id, room_id, message, created_at) VALUES ($1, $2, $3, NOW()) RETURNING *",
-        [uid, roomId || userRoom[0], message]
+        [uid, room || userRoom[0], text]
       );
       
       // Broadcast to room
       const messageData = {
         id: rows[0].id,
         uid,
-        message,
+        text,
         timestamp: rows[0].created_at,
         username: socket.data.user.username
       };
       
-      if (roomId) {
-        io.to(roomId).emit("chat_message", messageData);
+      if (room) {
+        io.to(room).emit("message", messageData);
       } else {
-        io.to(userRoom[0]).emit("chat_message", messageData);
+        io.to(userRoom[0]).emit("message", messageData);
       }
     } catch (err) { 
       console.error("Chat message error:", err); 
       socket.emit("error", { message: "Failed to send message" });
+    }
+  });
+
+  // Added to match frontend
+  socket.on("name-update", async ({ room, name }) => {
+    const uid = requireSocketUser(socket);
+    if (!uid) return;
+    
+    try {
+      // Check if user is in a room
+      const userRoom = userRooms.get(uid);
+      if (!userRoom || (room && !userRoom.includes(room))) {
+        return;
+      }
+      
+      // Update username in database
+      await pool.query(
+        "UPDATE users SET username=$1, updated_at=NOW() WHERE id=$2",
+        [name, uid]
+      );
+      
+      // Update cache
+      const updatedUser = { ...socket.data.user, username: name };
+      userCache.set(`user:${uid}`, updatedUser);
+      socket.data.user = updatedUser;
+      
+      // Broadcast to room
+      if (room) {
+        io.to(room).emit("name-update", { name, uid });
+      } else {
+        io.to(userRoom[0]).emit("name-update", { name, uid });
+      }
+    } catch (err) {
+      console.error("Name update error:", err);
     }
   });
 
@@ -1066,6 +1174,7 @@ app.post("/generateToken", requireAuth, async (req, res) => {
   }
 });
 
+// Fixed to match frontend
 app.post("/user/display-name", requireAuth, async (req, res) => {
   try {
     const { display_name } = req.body;
@@ -1101,7 +1210,8 @@ app.post("/user/display-name", requireAuth, async (req, res) => {
 });
 
 // ------------------- USER PROFILE -------------------
-app.get("/api/user/profile", requireAuth, async (req, res) => {
+// Fixed to match frontend
+app.get("/user/profile", requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, username, email, provider, avatar, gender, location, interests, 
@@ -1123,6 +1233,8 @@ app.get("/api/user/profile", requireAuth, async (req, res) => {
     
     const profile = {
       ...rows[0],
+      display_name: rows[0].username, // Add display_name to match frontend
+      is_admin: rows[0].role === 'admin', // Add is_admin to match frontend
       stats: stats[0]
     };
     
@@ -1362,6 +1474,117 @@ app.post("/api/admin/appeals/:id/respond", requireAuth, async (req, res) => {
   } catch (err) {
     console.error("Failed to respond to appeal:", err);
     res.status(500).json({ error: "Could not respond to appeal" });
+  }
+});
+
+// ------------------- ADMIN USER MANAGEMENT -------------------
+// Added to match frontend
+app.get("/api/admin/users", requireAuth, async (req, res) => {
+  try {
+    // Check if user is admin
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: "Admin access required" });
+    }
+    
+    const { query } = req.query;
+    if (!query) {
+      return res.status(400).json({ error: "Search query required" });
+    }
+    
+    const { rows } = await pool.query(
+      `SELECT id, username, email, banned_until, ban_reason 
+       FROM users 
+       WHERE username ILIKE $1 OR email ILIKE $1
+       LIMIT 20`,
+      [`%${query}%`]
+    );
+    
+    res.json({ users: rows });
+  } catch (err) {
+    console.error("Failed to search users:", err);
+    res.status(500).json({ error: "Could not search users" });
+  }
+});
+
+// Added to match frontend
+app.post("/api/admin/ban", requireAuth, async (req, res) => {
+  try {
+    // Check if user is admin
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: "Admin access required" });
+    }
+    
+    const { userId } = req.body;
+    if (!userId) {
+      return res.status(400).json({ error: "User ID required" });
+    }
+    
+    // Ban user for 30 days
+    const banUntil = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    
+    await pool.query(
+      "UPDATE users SET banned_until=$1, ban_reason=$2, updated_at=NOW() WHERE id=$3",
+      [banUntil, "Banned by admin", userId]
+    );
+    
+    // Log the ban
+    await pool.query(
+      "INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())",
+      [userId, "admin_ban", "Banned by admin"]
+    );
+    
+    // Invalidate cache
+    userCache.del(`user:${userId}`);
+    
+    // Disconnect user if online
+    const socketId = onlineSockets.get(String(userId));
+    if (socketId) {
+      io.sockets.sockets.get(socketId)?.emit("banned", { 
+        reason: "Banned by admin", 
+        until: banUntil,
+        canAppeal: true
+      });
+      io.sockets.sockets.get(socketId)?.disconnect(true);
+    }
+    
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Failed to ban user:", err);
+    res.status(500).json({ error: "Could not ban user" });
+  }
+});
+
+// Added to match frontend
+app.post("/api/admin/unban", requireAuth, async (req, res) => {
+  try {
+    // Check if user is admin
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: "Admin access required" });
+    }
+    
+    const { userId } = req.body;
+    if (!userId) {
+      return res.status(400).json({ error: "User ID required" });
+    }
+    
+    await pool.query(
+      "UPDATE users SET banned_until=NULL, ban_reason=NULL, updated_at=NOW() WHERE id=$1",
+      [userId]
+    );
+    
+    // Log the unban
+    await pool.query(
+      "INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())",
+      [userId, "admin_unban", "Unbanned by admin"]
+    );
+    
+    // Invalidate cache
+    userCache.del(`user:${userId}`);
+    
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Failed to unban user:", err);
+    res.status(500).json({ error: "Could not unban user" });
   }
 });
 
