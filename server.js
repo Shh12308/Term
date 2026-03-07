@@ -268,6 +268,25 @@ passport.use(new FacebookStrategy({
   } catch (err) { done(err, null); }
 }));
 
+let waitingQueue = [];
+
+function findMatch(user) {
+
+  if (waitingQueue.length > 0) {
+
+    let partner = waitingQueue.shift();
+
+    let channel = "room_" + Date.now();
+
+    startCall(user, partner, channel);
+
+  } else {
+
+    waitingQueue.push(user);
+
+  }
+}
+
 // ------------------- JWT HELPER -------------------
 function signJwtForUser(user) {
   const payload = { 
