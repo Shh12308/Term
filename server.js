@@ -42,8 +42,7 @@ app.use(helmet({
 }));
 
 app.use(cors({ 
-  origin: process.env.FRONTEND_URL || "*", 
-  credentials: true 
+  origin: process.env.FRONTEND_URL
 }));
 
 // Rate limiting
@@ -66,8 +65,7 @@ app.use(express.json({ limit: "5mb" }));
 const server = http.createServer(app);
 const io = new SocketIOServer(server, { 
   cors: { 
-    origin: process.env.FRONTEND_URL || "*",
-    credentials: true
+    origin: process.env.FRONTEND_URL
   },
   pingTimeout: 60000,
   pingInterval: 25000
