@@ -81,7 +81,7 @@ const redis = new Redis({
 });
 
 // In-memory cache for frequently accessed data
-const userCache = new NodeCache({ stdTTL: 300 }); // 5 minutes cache
+await redis.set(`user:${id}`, JSON.stringify(user), "EX", 300);
 
 const pool = new pg.Pool({
   user: process.env.DB_USER,
@@ -268,7 +268,7 @@ passport.use(new FacebookStrategy({
   } catch (err) { done(err, null); }
 }));
 
-let waitingQueue = [];
+await redis.lpush("match_queue", userId);
 
 function findMatch(user) {
 
@@ -678,11 +678,16 @@ io.on("connection", (socket) => {
       // Convert back to base64
       const processedBase64 = `data:image/jpeg;base64,${processedImage.toString('base64')}`;
       
-      // Moderate the frame
-      const mod = await OPENAI.moderations.create({ 
-        model: "omni-moderation-latest", 
-        input: processedBase64 
-      });
+      await OPENAI.responses.create({
+  model: "gpt-4.1-mini",
+  input: [{
+    role: "user",
+    content: [
+      { type: "input_text", text: "Check if this image contains nudity or sexual content" },
+      { type: "input_image", image_url: processedBase64 }
+    ]
+  }]
+});
       
       const flagged = mod.results?.[0]?.categories?.sexual || 
                     mod.results?.[0]?.categories?.hate || 
@@ -891,7 +896,7 @@ app.post('/api/verify-payment', requireAuth, async (req, res) => {
     const { sessionId } = req.body;
     
     // Initialize Stripe
-    const stripe = require('stripe')('sk_test_51234567890abcdef'); // Replace with your Stripe secret key
+    const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
     
     // Retrieve the session
     const session = await stripe.checkout.sessions.retrieve(sessionId);
@@ -953,31 +958,6 @@ async function ensureCoinsColumn() {
 
 // Call this when server starts
 ensureCoinsColumn();
-
-// Update user profile endpoint to include coins
-app.get('/user/profile', requireAuth, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, username, email, provider, avatar, gender, location, interests, 
-       nickname, age_verified, created_at, updated_at, coins
-       FROM users WHERE id = $1`,
-      [req.user.id]
-    );
-    
-    if (!rows.length) return res.status(404).json({ error: "User not found" });
-    
-    const profile = {
-      ...rows[0],
-      display_name: rows[0].username,
-      is_admin: rows[0].role === 'admin'
-    };
-    
-    res.json(profile);
-  } catch (err) {
-    console.error("Profile fetch failed:", err);
-    res.status(500).json({ error: "Could not fetch profile" });
-  }
-});
 
 // Spend coins endpoint
 app.post('/api/user/spend-coins', requireAuth, async (req, res) => {
@@ -1393,38 +1373,24 @@ app.post("/user/display-name", requireAuth, async (req, res) => {
   }
 });
 
-// ------------------- USER PROFILE -------------------
-// Fixed to match frontend
 app.get("/user/profile", requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT id, username, email, provider, avatar, gender, location, interests, 
-       nickname, age_verified, created_at, updated_at 
-       FROM users WHERE id = $1`,
+      `SELECT id, username, email, provider, avatar, gender, location,
+       interests, nickname, age_verified, created_at, updated_at, coins
+       FROM users WHERE id=$1`,
       [req.user.id]
     );
-    
+
     if (!rows.length) return res.status(404).json({ error: "User not found" });
-    
-    // Get user stats
-    const { rows: stats } = await pool.query(
-      `SELECT 
-       (SELECT COUNT(*) FROM matches WHERE user_a=$1 OR user_b=$1) as total_matches,
-       (SELECT COUNT(*) FROM user_reports WHERE reporter_id=$1) as reports_filed,
-       (SELECT COUNT(*) FROM user_reports WHERE reported_id=$1) as reports_received`,
-      [req.user.id]
-    );
-    
-    const profile = {
+
+    res.json({
       ...rows[0],
-      display_name: rows[0].username, // Add display_name to match frontend
-      is_admin: rows[0].role === 'admin', // Add is_admin to match frontend
-      stats: stats[0]
-    };
-    
-    res.json(profile);
+      display_name: rows[0].username,
+      is_admin: rows[0].role === "admin"
+    });
+
   } catch (err) {
-    console.error("Profile fetch failed:", err);
     res.status(500).json({ error: "Could not fetch profile" });
   }
 });
