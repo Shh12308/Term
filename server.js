@@ -1384,10 +1384,15 @@ app.get("/user/profile", requireAuth, async (req, res) => {
 
     if (!rows.length) return res.status(404).json({ error: "User not found" });
 
+    const user = rows[0]; // ✅ define it
+
+    // ✅ cache user in Redis
+    await redis.set(`user:${user.id}`, JSON.stringify(user), "EX", 300);
+
     res.json({
-      ...rows[0],
-      display_name: rows[0].username,
-      is_admin: rows[0].role === "admin"
+      ...user,
+      display_name: user.username,
+      is_admin: user.role === "admin"
     });
 
   } catch (err) {
