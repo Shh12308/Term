@@ -464,15 +464,22 @@ io.on("connection", (socket) => {
       });
       
       // Log room join
+      io.on("connection", (socket) => {
+  socket.on("join", async ({ userId, room }) => {
+    try {
       await pool.query(
         "INSERT INTO room_activity (user_id, room_id, action, created_at) VALUES ($1, $2, $3, NOW())",
         [userId, room, "join"]
       );
+
+      socket.join(room);
+
     } catch (err) {
       console.error("Error joining room:", err);
       socket.emit("error", { message: "Failed to join room" });
     }
   });
+});
 
   // Updated to match frontend
   socket.on("message", async ({ room, text }) => {
