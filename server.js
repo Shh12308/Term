@@ -80,9 +80,6 @@ const redis = new Redis({
   maxRetriesPerRequest: 3,
 });
 
-// In-memory cache for frequently accessed data
-await redis.set(`user:${user.id}`, JSON.stringify(user), "EX", 300);
-
 const pool = new pg.Pool({
   user: process.env.DB_USER,
   host: process.env.DB_HOST,
