@@ -392,86 +392,42 @@ async function detectSuspiciousBehavior(userId, action, metadata = {}) {
 }
 
 io.on("connection", (socket) => {
-  const userId = socket.userId;
+  
+  console.log("User connected:", socket.id);
 
-  socket.join(userId);
+  // JOIN ROOM
+  socket.on("join", async ({ room, uid, name }) => {
+    socket.join(room);
 
-  socket.on("start_search", async () => {
-    await redis.lpush("match_queue", userId);
+    console.log(`${name || uid} joined room ${room}`);
 
-    const partnerId = await redis.rpop("match_queue");
-
-    if (partnerId && partnerId !== userId) {
-      await redis.set(`match:${userId}`, partnerId);
-      await redis.set(`match:${partnerId}`, userId);
-
-      io.to(userId).emit("match_found", { partnerId });
-      io.to(partnerId).emit("match_found", { partnerId: userId });
-    }
-  });
-
-  socket.on("message", async ({ text }) => {
-    const partnerId = await redis.get(`match:${userId}`);
-    if (!partnerId) return;
-
-    io.to(partnerId).emit("message", {
-      text,
-      from: userId
+    socket.to(room).emit("message", {
+      username: "System",
+      text: `${name || uid} joined the chat`
     });
-
-    // Save history
-    await pool.query(
-      "INSERT INTO messages(sender_id, receiver_id, text) VALUES($1,$2,$3)",
-      [userId, partnerId, text]
-    );
   });
 
-  socket.on("typing", async () => {
-    const partnerId = await redis.get(`match:${userId}`);
-    if (partnerId) {
-      io.to(partnerId).emit("typing");
-    }
+  // MESSAGE
+  socket.on("message", ({ room, text, username }) => {
+    socket.to(room).emit("message", {
+      username,
+      text
+    });
   });
 
-  socket.on("disconnect", async () => {
-    const partnerId = await redis.get(`match:${userId}`);
-
-    if (partnerId) {
-      io.to(partnerId).emit("partner_disconnected");
-      await redis.del(`match:${partnerId}`);
-    }
-
-    await redis.del(`match:${userId}`);
+  // TYPING
+  socket.on("typing", ({ room }) => {
+    socket.to(room).emit("typing");
   });
+
+  // DISCONNECT
+  socket.on("disconnect", () => {
+    console.log("User disconnected:", socket.id);
+  });
+
 });
 
-  // Updated to match frontend
-  socket.on("join", async ({ room, uid, name }) => {
-    if (!room) return;
-    
-    const userId = requireSocketUser(socket);
-    if (!userId) return;
-    
-    try {
-      // Check if user is already in a room
-      const currentRooms = userRooms.get(userId) || [];
-      if (currentRooms.length > 0) {
-        // Leave current rooms
-        currentRooms.forEach(r => {
-          socket.leave(r);
-          socket.to(r).emit("partner-left", { socketId: socket.id, userId });
-          
-          // Update room participants
-          const participants = roomParticipants.get(r);
-          if (participants) {
-            const index = participants.indexOf(userId);
-            if (index > -1) {
-              participants.splice(index, 1);
-              roomParticipants.set(r, participants);
-            }
-          }
-        });
-      }
+
       
       // Join new room
       socket.join(room);
