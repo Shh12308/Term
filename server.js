@@ -99,10 +99,6 @@ const pool = new pg.Pool({
   connectionTimeoutMillis: 2000,
 });
 
-const userCache = new NodeCache({ stdTTL: 300 });
-
-const waitingQueue = [];
-
 const JWT_SECRET = process.env.JWT_SECRET || "super_secret_jwt_key";
 const OPENAI = new OpenAI({ 
   apiKey: process.env.OPENAI_API_KEY || "",
@@ -397,98 +393,58 @@ async function detectSuspiciousBehavior(userId, action, metadata = {}) {
 }
 
 io.on("connection", (socket) => {
-  socket.on("auth", async ({ token }) => {
-    try {
-      const decoded = jwt.verify(token, JWT_SECRET);
-      onlineSockets.set(String(decoded.id), socket.id);
-      socket.data.userId = String(decoded.id);
-      socket.data.authenticated = true;
-      
-      // Get user data
-      const { rows } = await pool.query("SELECT * FROM users WHERE id=$1", [decoded.id]);
-      if (rows[0]) {
-        socket.data.user = rows[0];
-        
-        // Check if user is banned
-        if (rows[0].banned_until && new Date(rows[0].banned_until) > new Date()) {
-          socket.emit("banned", { 
-            reason: rows[0].ban_reason || "Violation of terms", 
-            until: rows[0].banned_until,
-            canAppeal: true
-          });
-          socket.disconnect(true);
-          return;
-        }
-        
-        // Log connection
-        await pool.query(
-          "INSERT INTO user_connections (user_id, socket_id, ip_address, user_agent, created_at) VALUES ($1, $2, $3, $4, NOW())",
-          [decoded.id, socket.id, socket.handshake.address, socket.handshake.headers["user-agent"]]
-        );
-      }
-      
-      console.log("Socket auth success for user:", decoded.id);
-    } catch (err) {
-      socket.disconnect(true);
+  const userId = socket.userId;
+
+  socket.join(userId);
+
+  socket.on("start_search", async () => {
+    await redis.lpush("match_queue", userId);
+
+    const partnerId = await redis.rpop("match_queue");
+
+    if (partnerId && partnerId !== userId) {
+      await redis.set(`match:${userId}`, partnerId);
+      await redis.set(`match:${partnerId}`, userId);
+
+      io.to(userId).emit("match_found", { partnerId });
+      io.to(partnerId).emit("match_found", { partnerId: userId });
     }
   });
 
-  socket.on("start_match", async () => {
-  const uid = socket.data.userId;
-  if (!uid) return;
+  socket.on("message", async ({ text }) => {
+    const partnerId = await redis.get(`match:${userId}`);
+    if (!partnerId) return;
 
-  const user = socket.data.user;
+    io.to(partnerId).emit("message", {
+      text,
+      from: userId
+    });
 
-  const match = await findMatch(user);
+    // Save history
+    await pool.query(
+      "INSERT INTO messages(sender_id, receiver_id, text) VALUES($1,$2,$3)",
+      [userId, partnerId, text]
+    );
+  });
 
-  if (match) {
-    const channel = match.channel;
-
-    const peerSocketId = onlineSockets.get(String(match.userB));
-
-    // Notify both users
-    socket.emit("match_found", { channel, peerId: match.userB });
-
-    if (peerSocketId) {
-      io.to(peerSocketId).emit("match_found", { channel, peerId: match.userA });
+  socket.on("typing", async () => {
+    const partnerId = await redis.get(`match:${userId}`);
+    if (partnerId) {
+      io.to(partnerId).emit("typing");
     }
-  }
-});
+  });
 
   socket.on("disconnect", async () => {
-    const uid = socket.data.userId;
-    if (uid) {
-      onlineSockets.delete(String(uid));
-      
-      // Leave any rooms the user was in
-      const rooms = userRooms.get(uid);
-      if (rooms) {
-        rooms.forEach(room => {
-          socket.leave(room);
-          
-          // Notify other participants
-          socket.to(room).emit("partner-left", { socketId: socket.id, userId: uid });
-          
-          // Update room participants
-          const participants = roomParticipants.get(room);
-          if (participants) {
-            const index = participants.indexOf(uid);
-            if (index > -1) {
-              participants.splice(index, 1);
-              roomParticipants.set(room, participants);
-            }
-          }
-        });
-        userRooms.delete(uid);
-      }
-      
-      // Log disconnection
-      await pool.query(
-        "UPDATE user_connections SET disconnected_at=NOW() WHERE socket_id=$1 AND disconnected_at IS NULL",
-        [socket.id]
-      ).catch(() => {});
+    const partnerId = await redis.get(`match:${userId}`);
+
+    if (partnerId) {
+      io.to(partnerId).emit("partner_disconnected");
+      await redis.del(`match:${partnerId}`);
     }
+
+    await redis.del(`match:${userId}`);
   });
+});
 
   // Updated to match frontend
   socket.on("join", async ({ room, uid, name }) => {
@@ -681,97 +637,96 @@ io.on("connection", (socket) => {
     }
   });
 
-  let lastFrameModeration = 0;
-  socket.on("video_frame", async ({ frameBase64, roomId }) => {
-    const uid = requireSocketUser(socket);
-    if (!uid) return;
-    
-    // Rate limit frame moderation
-    if (Date.now() - lastFrameModeration < 1000) return;
-    lastFrameModeration = Date.now();
-    
-    try {
-      // Check if user is in a room
-      const userRoom = userRooms.get(uid);
-      if (!userRoom || (roomId && !userRoom.includes(roomId))) {
-        return; // Silently ignore if not in room
-      }
-      
-      // Detect suspicious behavior
-      await detectSuspiciousBehavior(uid, "video_frame");
-      
-      // Process image with sharp for optimization
-      const buffer = Buffer.from(frameBase64.split(',')[1], 'base64');
-      const processedImage = await sharp(buffer)
-        .resize({ width: 320, height: 240, fit: 'inside' })
-        .jpeg({ quality: 70 })
-        .toBuffer();
-      
-      // Convert back to base64
-const processedBase64 = processedImage.toString("base64");
+let lastFrameModeration = 0;
 
-const mod = await OPENAI.moderations.create({
-  model: "omni-moderation-latest",
-  input: [
-    {
-      type: "image",
-      image: processedBase64
+socket.on("video_frame", async ({ frameBase64, roomId }) => {
+  const uid = requireSocketUser(socket);
+  if (!uid) return;
+
+  // Rate limit frame moderation
+  if (Date.now() - lastFrameModeration < 1000) return;
+  lastFrameModeration = Date.now();
+
+  try {
+    // Check if user is in a room
+    const userRoom = userRooms.get(uid);
+    if (!userRoom || (roomId && !userRoom.includes(roomId))) {
+      return;
     }
-  ]
-});
 
-const result = mod.results?.[0];
+    // Detect suspicious behavior
+    await detectSuspiciousBehavior(uid, "video_frame");
 
-const flagged =
-  result?.flagged ||
-  result?.categories?.sexual ||
-  result?.categories?.violence ||
-  result?.categories?.hate;
+    // Process image with sharp
+    const buffer = Buffer.from(frameBase64.split(',')[1], 'base64');
 
-if (flagged) {
-  const banReason = `Inappropriate content detected`;
+    const processedImage = await sharp(buffer)
+      .resize({ width: 320, height: 240, fit: 'inside' })
+      .jpeg({ quality: 70 })
+      .toBuffer();
 
-  await pool.query(
-    "UPDATE users SET banned_until = NOW() + INTERVAL '750 hours', ban_reason=$1 WHERE id=$2",
-    [banReason, uid]
-  );
-}
-        
-        socket.emit("moderation_action", { 
-          type: "video", 
-          banned: true, 
-          duration_hours: BAN_HOURS,
-          reason: banReason
+    const processedBase64 = `data:image/jpeg;base64,${processedImage.toString("base64")}`;
+
+    // Moderation
+    const mod = await OPENAI.moderations.create({
+      model: "omni-moderation-latest",
+      input: processedBase64
+    });
+
+    const result = mod.results?.[0];
+
+    const flagged =
+      result?.flagged ||
+      result?.categories?.sexual ||
+      result?.categories?.violence ||
+      result?.categories?.hate;
+
+    // 🚨 ONLY RUN BAN LOGIC IF FLAGGED
+    if (flagged) {
+      const banReason = `Inappropriate content detected`;
+
+      await pool.query(
+        "UPDATE users SET banned_until = NOW() + INTERVAL '750 hours', ban_reason=$1 WHERE id=$2",
+        [banReason, uid]
+      );
+
+      await pool.query(
+        "INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())",
+        [uid, "auto_ban", banReason]
+      );
+
+      socket.emit("moderation_action", {
+        type: "video",
+        banned: true,
+        duration_hours: BAN_HOURS,
+        reason: banReason
+      });
+
+      socket.disconnect(true);
+      return;
+    }
+
+    // ✅ Forward frame to the other user
+    const targetRoom = roomId || userRoom[0];
+    const participants = roomParticipants.get(targetRoom) || [];
+
+    const otherUserId = participants.find(id => id !== uid);
+
+    if (otherUserId) {
+      const otherSocketId = onlineSockets.get(String(otherUserId));
+
+      if (otherSocketId) {
+        io.to(otherSocketId).emit("video_frame", {
+          frameBase64: processedBase64,
+          from: uid
         });
-        
-        // Log the ban
-        await pool.query(
-          "INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())",
-          [uid, "auto_ban", banReason]
-        );
-        
-        socket.disconnect(true);
-        return;
       }
-      
-      // Forward frame to the other user in the room
-      const targetRoom = roomId || userRoom[0];
-      const participants = roomParticipants.get(targetRoom) || [];
-      const otherUserId = participants.find(id => id !== uid);
-      
-      if (otherUserId) {
-        const otherSocketId = onlineSockets.get(String(otherUserId));
-        if (otherSocketId) {
-          io.to(otherSocketId).emit("video_frame", { 
-            frameBase64: processedBase64,
-            from: uid
-          });
-        }
-      }
-    } catch (err) { 
-      console.error("Video moderation error:", err); 
     }
-  });
+
+  } catch (err) {
+    console.error("Video moderation error:", err);
+  }
+});
 
   socket.on("join_room", async ({ room }) => {
     if (!room) return;
@@ -1099,21 +1054,7 @@ app.post('/api/user/spend-coins', requireAuth, async (req, res) => {
     }
   });
 
-  socket.on("webrtc.offer", ({ room, sdp }) => { 
-    if (!room || !sdp) return; 
-    socket.to(room).emit("webrtc.offer", { from: socket.id, sdp }); 
-  });
-  
-  socket.on("webrtc.answer", ({ room, sdp }) => { 
-    if (!room || !sdp) return; 
-    socket.to(room).emit("webrtc.answer", { from: socket.id, sdp }); 
-  });
-  
-  socket.on("webrtc.ice", ({ room, candidate }) => { 
-    if (!room || !candidate) return; 
-    socket.to(room).emit("webrtc.ice", { from: socket.id, candidate }); 
-  });
-});
+
 
 // ------------------- MATCHMAKING -------------------
 async function tryFindMatch(userId, genderPref, locationPref, interests = []) {
