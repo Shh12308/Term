@@ -120,7 +120,6 @@ const { Client, resources } = CoinbaseCommerce;
 const { Charge } = resources;
 Client.init(process.env.COINBASE_COMMERCE_API_KEY);
 
-const waitingQueue = [];
 const userCache = new NodeCache({ stdTTL: 300, checkperiod: 120 });
 
 // ------------------- SESSION & PASSPORT -------------------
