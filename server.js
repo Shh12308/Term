@@ -72,24 +72,33 @@ const io = new SocketIOServer(server, {
 });
 
 // Redis for session storage and caching
-const redis = new Redis({
-  host: process.env.REDIS_HOST || "localhost",
-  port: process.env.REDIS_PORT || 6379,
-  password: process.env.REDIS_PASSWORD,
-  retryDelayOnFailover: 100,
-  maxRetriesPerRequest: 3,
+const redis = new Redis(process.env.REDIS_URL, {
+  maxRetriesPerRequest: null,
+  retryStrategy: (times) => Math.min(times * 50, 2000),
+  tls: process.env.REDIS_URL?.startsWith("rediss://") ? {} : undefined,
+});
+
+redis.on("error", (err) => {
+  console.error("Redis error:", err.message);
+});
+
+redis.on("connect", () => {
+  console.log("Redis connected");
 });
 
 const pool = new pg.Pool({
-  user: process.env.DB_USER,
-  host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
-  password: process.env.DB_PASS,
-  port: process.env.DB_PORT,
-  max: 20, // Maximum number of clients in the pool
-  idleTimeoutMillis: 30000, // How long a client is allowed to remain idle before being closed
-  connectionTimeoutMillis: 2000, // How long to wait when connecting a new client
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  },
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
 });
+
+const userCache = new NodeCache({ stdTTL: 300 });
+
+const waitingQueue = [];
 
 const JWT_SECRET = process.env.JWT_SECRET || "super_secret_jwt_key";
 const OPENAI = new OpenAI({ 
@@ -111,6 +120,9 @@ const MIN_AGE_FOR_VIDEO = 18; // Minimum age to use video
 const { Client, resources } = CoinbaseCommerce;
 const { Charge } = resources;
 Client.init(process.env.COINBASE_COMMERCE_API_KEY);
+
+const waitingQueue = [];
+const userCache = new NodeCache({ stdTTL: 300, checkperiod: 120 });
 
 // ------------------- SESSION & PASSPORT -------------------
 const PGStore = pgSessionImport(session);
@@ -265,20 +277,20 @@ passport.use(new FacebookStrategy({
   } catch (err) { done(err, null); }
 }));
 
-function findMatch(user) {
-
+async function findMatch(user) {
   if (waitingQueue.length > 0) {
+    const partner = waitingQueue.shift();
 
-    let partner = waitingQueue.shift();
+    const channel = "room_" + Date.now();
 
-    let channel = "room_" + Date.now();
-
-    startCall(user, partner, channel);
-
+    return {
+      userA: user.id,
+      userB: partner.id,
+      channel
+    };
   } else {
-
     waitingQueue.push(user);
-
+    return null;
   }
 }
 
@@ -417,6 +429,28 @@ io.on("connection", (socket) => {
       socket.disconnect(true);
     }
   });
+
+  socket.on("start_match", async () => {
+  const uid = socket.data.userId;
+  if (!uid) return;
+
+  const user = socket.data.user;
+
+  const match = await findMatch(user);
+
+  if (match) {
+    const channel = match.channel;
+
+    const peerSocketId = onlineSockets.get(String(match.userB));
+
+    // Notify both users
+    socket.emit("match_found", { channel, peerId: match.userB });
+
+    if (peerSocketId) {
+      io.to(peerSocketId).emit("match_found", { channel, peerId: match.userA });
+    }
+  }
+});
 
   socket.on("disconnect", async () => {
     const uid = socket.data.userId;
@@ -671,30 +705,34 @@ io.on("connection", (socket) => {
         .toBuffer();
       
       // Convert back to base64
-      const processedBase64 = `data:image/jpeg;base64,${processedImage.toString('base64')}`;
-      
-      await OPENAI.responses.create({
-  model: "gpt-4.1-mini",
-  input: [{
-    role: "user",
-    content: [
-      { type: "input_text", text: "Check if this image contains nudity or sexual content" },
-      { type: "input_image", image_url: processedBase64 }
-    ]
-  }]
+const processedBase64 = processedImage.toString("base64");
+
+const mod = await OPENAI.moderations.create({
+  model: "omni-moderation-latest",
+  input: [
+    {
+      type: "image",
+      image: processedBase64
+    }
+  ]
 });
-      
-      const flagged = mod.results?.[0]?.categories?.sexual || 
-                    mod.results?.[0]?.categories?.hate || 
-                    mod.results?.[0]?.categories?.violence || 
-                    mod.results?.[0]?.flagged;
-      
-      if (flagged) {
-        const banReason = `Inappropriate video content: ${mod.results[0].category_scores}`;
-        await pool.query(
-          "UPDATE users SET banned_until = NOW() + INTERVAL '750 hours', ban_reason=$1 WHERE id=$2",
-          [banReason, uid]
-        );
+
+const result = mod.results?.[0];
+
+const flagged =
+  result?.flagged ||
+  result?.categories?.sexual ||
+  result?.categories?.violence ||
+  result?.categories?.hate;
+
+if (flagged) {
+  const banReason = `Inappropriate content detected`;
+
+  await pool.query(
+    "UPDATE users SET banned_until = NOW() + INTERVAL '750 hours', ban_reason=$1 WHERE id=$2",
+    [banReason, uid]
+  );
+}
         
         socket.emit("moderation_action", { 
           type: "video", 
