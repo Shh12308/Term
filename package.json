@@ -13,7 +13,7 @@
   },
 "dependencies": {
   "agora-access-token": "^2.0.4",
-  "coinbase-commerce-node": "^3.0.0",
+  "coinbase-commerce-node": "^1.0.4",
   "connect-pg-simple": "^9.0.1",
   "cors": "^2.8.5",
   "dotenv": "^16.3.1",
