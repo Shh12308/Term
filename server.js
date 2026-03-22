@@ -45,6 +45,9 @@ app.use(cors({
   origin: process.env.FRONTEND_URL
 }));
 
+// Matchmaking queue (global)
+const waitingQueue = [];
+
 // Rate limiting
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
