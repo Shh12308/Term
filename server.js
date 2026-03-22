@@ -265,8 +265,6 @@ passport.use(new FacebookStrategy({
   } catch (err) { done(err, null); }
 }));
 
-await redis.lpush("match_queue", userId);
-
 function findMatch(user) {
 
   if (waitingQueue.length > 0) {
