@@ -390,6 +390,19 @@ app.get(
   }
 );
 
+app.get("/auth/me", async (req, res) => {
+  try {
+    await requireAuth(req, res, async () => {
+      return res.json({
+        authenticated: true,
+        user: req.user,
+      });
+    });
+  } catch {
+    res.json({ authenticated: false });
+  }
+});
+
 app.get("/auth/failure", (req, res) => res.status(401).json({ error: "Authentication failed" }));
 
 // ------------------- SOCKET.IO -------------------
