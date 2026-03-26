@@ -1373,6 +1373,82 @@ app.post("/user/display-name", requireAuth, async (req, res) => {
   }
 });
 
+app.post("/auth/exchange", async (req, res) => {
+  const { code, provider } = req.body;
+
+  if (!code || !provider) {
+    return res.status(400).json({ error: "Missing code or provider" });
+  }
+
+  try {
+    let tokenResponse;
+    switch (provider.toLowerCase()) {
+      case "discord":
+        tokenResponse = await fetch("https://discord.com/api/oauth2/token", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            client_id: process.env.DISCORD_CLIENT_ID,
+            client_secret: process.env.DISCORD_CLIENT_SECRET,
+            grant_type: "authorization_code",
+            code,
+            redirect_uri: "https://yourdomain.com/callback.html",
+          })
+        });
+        break;
+
+      case "google":
+        tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            client_id: process.env.GOOGLE_CLIENT_ID,
+            client_secret: process.env.GOOGLE_CLIENT_SECRET,
+            grant_type: "authorization_code",
+            code,
+            redirect_uri: "https://yourdomain.com/callback.html",
+          })
+        });
+        break;
+
+      case "facebook":
+        tokenResponse = await fetch(`https://graph.facebook.com/v16.0/oauth/access_token?` +
+          new URLSearchParams({
+            client_id: process.env.FACEBOOK_APP_ID,
+            client_secret: process.env.FACEBOOK_APP_SECRET,
+            redirect_uri: "https://yourdomain.com/callback.html",
+            code,
+          })
+        );
+        break;
+
+      default:
+        return res.status(400).json({ error: "Unknown provider" });
+    }
+
+    const tokenData = await tokenResponse.json();
+    if (!tokenData.access_token) {
+      return res.status(400).json({ error: "Failed to get access token", details: tokenData });
+    }
+
+    // Optionally: fetch user info from provider
+    // e.g., Discord: https://discord.com/api/users/@me
+
+    // Issue your own JWT token for frontend usage
+    const jwtToken = jwt.sign(
+      { provider, accessToken: tokenData.access_token },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    res.json({ token: jwtToken });
+
+  } catch (err) {
+    console.error("Auth exchange error:", err);
+    res.status(500).json({ error: "Server error", details: err.message });
+  }
+});
+
 app.get("/user/profile", requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(
