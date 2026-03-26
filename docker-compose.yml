@@ -5,11 +5,23 @@ services:
       - "8080:8080"
     depends_on:
       - redis
+      - db
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/omevo
 
   redis:
     image: redis:7
     ports:
       - "6379:6379"
+
+  db:
+    image: postgres:15
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: omevo
+    ports:
+      - "5432:5432"
