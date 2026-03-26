@@ -412,7 +412,8 @@ const roomParticipants = new Map(); // Track participants in each room
 
 function requireSocketUser(socket) {
   if (!socket.data.userId) {
-    socket.disconnect(true);
+    // Only disconnect if trying to perform restricted actions, not immediately on connection
+    // But for safety in restricted routes:
     return null;
   }
   return socket.data.userId;
@@ -450,6 +451,48 @@ async function detectSuspiciousBehavior(userId, action, metadata = {}) {
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
+  // ------------------- FIX: SOCKET AUTH HANDLER -------------------
+  // Frontend emits 'auth' event with token. We handle it here.
+  socket.on("auth", async ({ token }) => {
+    try {
+      if (!token) {
+        return socket.emit("error", { message: "Authentication token required" });
+      }
+
+      const decoded = jwt.verify(token, JWT_SECRET);
+      
+      // Fetch user from DB or Cache
+      let user = userCache.get(`user:${decoded.id}`);
+      if (!user) {
+        const { rows } = await pool.query("SELECT * FROM users WHERE id=$1", [decoded.id]);
+        if (rows[0]) {
+            user = rows[0];
+            userCache.set(`user:${decoded.id}`, user);
+        } else {
+            throw new Error("User not found");
+        }
+      }
+
+      // Attach user info to socket
+      socket.data.userId = user.id;
+      socket.data.user = user;
+      
+      // Register in online sockets map
+      onlineSockets.set(String(user.id), socket.id);
+      
+      console.log(`User ${user.username} authenticated on socket ${socket.id}`);
+      
+      // Notify client they are authenticated
+      socket.emit("authenticated", { userId: user.id });
+
+    } catch (err) {
+      console.error("Socket auth error:", err.message);
+      // Don't necessarily disconnect, but restrict actions
+      socket.emit("error", { message: "Authentication failed" });
+    }
+  });
+  // ----------------------------------------------------------------
+
   // JOIN ROOM (Basic)
   socket.on("join", async ({ room, uid, name }) => {
     socket.join(room);
@@ -468,12 +511,22 @@ io.on("connection", (socket) => {
   // DISCONNECT
   socket.on("disconnect", () => {
     console.log("User disconnected:", socket.id);
+    
+    // ------------------- FIX: CLEANUP REGISTRY -------------------
+    // Remove user from onlineSockets map
+    if (socket.data.userId) {
+        onlineSockets.delete(String(socket.data.userId));
+        
+        // Optional: Leave queue on disconnect
+        pool.query("DELETE FROM queue WHERE user_id=$1", [String(socket.data.userId)]).catch(() => {});
+    }
+    // -------------------------------------------------------------
   });
 
   // Updated to match frontend (Detailed Message Handler)
   socket.on("message", async ({ room, text }) => {
     const uid = requireSocketUser(socket);
-    if (!uid) return;
+    if (!uid) return socket.emit("error", { message: "Not authenticated" });
 
     try {
       // Check if user is in a room
@@ -1032,6 +1085,7 @@ async function tryFindMatch(userId, genderPref, locationPref, interests = []) {
   ]);
   await pool.query("DELETE FROM queue WHERE user_id = ANY($1::text[])", [[userId, peerId]]).catch(() => {});
 
+  // ------------------- FIX: USE ONLINE SOCKET MAP -------------------
   const peerSocketId = onlineSockets.get(String(peerId));
   if (peerSocketId) {
     io.to(peerSocketId).emit("match_found", {
@@ -1047,6 +1101,7 @@ async function tryFindMatch(userId, genderPref, locationPref, interests = []) {
       },
     });
   }
+  // ------------------------------------------------------------------
 
   const requesterSocketId = onlineSockets.get(String(userId));
   if (requesterSocketId) {
@@ -1219,6 +1274,41 @@ app.post("/queue/enqueue", requireAuth, async (req, res) => {
     res.status(500).json({ error: "enqueue failed" });
   }
 });
+
+// ------------------- FIX: QUEUE CHECK ENDPOINT -------------------
+// Frontend polls this if no immediate match is found
+app.get("/queue/check", requireAuth, async (req, res) => {
+  try {
+    const userId = String(req.user.id);
+    
+    // Check if user has been matched in the database
+    const { rows } = await pool.query(
+      "SELECT * FROM matches WHERE (user_a=$1 OR user_b=$1) AND created_at > NOW() - INTERVAL '30 seconds' AND ended_at IS NULL LIMIT 1",
+      [userId]
+    );
+
+    if (rows.length > 0) {
+      const match = rows[0];
+      const peerId = match.user_a === userId ? match.user_b : match.user_a;
+      
+      // Fetch peer info
+      const { rows: peerRows } = await pool.query("SELECT username, nickname, avatar, gender, location, interests FROM users WHERE id=$1", [peerId]);
+      
+      return res.json({ 
+        matched: true, 
+        peerId, 
+        channel: match.channel_name,
+        peerInfo: peerRows[0]
+      });
+    }
+    
+    return res.json({ matched: false });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "queue check failed" });
+  }
+});
+// ----------------------------------------------------------------
 
 app.post("/queue/leave", requireAuth, async (req, res) => {
   try {
