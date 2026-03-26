@@ -78,21 +78,6 @@ const io = new SocketIOServer(server, {
   pingInterval: 25000,
 });
 
-// Redis for session storage and caching
-const redis = new Redis(process.env.REDIS_URL, {
-  maxRetriesPerRequest: null,
-  retryStrategy: (times) => Math.min(times * 50, 2000),
-  tls: process.env.REDIS_URL?.startsWith("rediss://") ? {} : undefined,
-});
-
-redis.on("error", (err) => {
-  console.error("Redis error:", err.message);
-});
-
-redis.on("connect", () => {
-  console.log("Redis connected");
-});
-
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
@@ -926,10 +911,9 @@ app.post("/api/create-checkout-session", requireAuth, async (req, res) => {
   try {
     const { coins, price } = req.body;
 
-    // Initialize Stripe
-    const stripe = require("stripe")("sk_test_51234567890abcdef"); // Replace with your Stripe secret key
+    // FIX: Use Environment Variable instead of hardcoded key
+    const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY); 
 
-    // Create checkout session
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
       line_items: [
@@ -939,7 +923,8 @@ app.post("/api/create-checkout-session", requireAuth, async (req, res) => {
             product_data: {
               name: `${coins} ChatVibe Coins`,
               description: `Purchase ${coins} coins for sending virtual gifts`,
-              images: ["https://your-domain.com/coins-image.png"],
+              // Ensure you have a valid image URL or remove this line
+              images: ["https://your-domain.com/coins-image.png"], 
             },
             unit_amount: Math.round(price * 100), // Convert to cents
           },
@@ -1066,7 +1051,7 @@ async function tryFindMatch(userId, genderPref, locationPref, interests = []) {
     WHERE q.user_id <> $1
       AND ($2='any' OR q.gender=$2)
       AND ($3='any' OR q.location=$3)
-      AND u.banned_until IS NULL OR u.banned_until < NOW()
+      AND (u.banned_until IS NULL OR u.banned_until < NOW())
     ORDER BY 
       CASE WHEN $4::text[] && q.interests THEN 1 ELSE 2 END,
       joined_at ASC 
@@ -1078,41 +1063,27 @@ async function tryFindMatch(userId, genderPref, locationPref, interests = []) {
   const peerId = rows[0].user_id;
   const channelName = `omevo_${Math.min(Number(userId), Number(peerId))}_${Math.max(Number(userId), Number(peerId))}_${Date.now()}`;
 
+  // 1. Insert match record
   await pool.query(`INSERT INTO matches (user_a, user_b, channel_name, created_at) VALUES ($1,$2,$3,NOW())`, [
     userId,
     peerId,
     channelName,
   ]);
+
+  // 2. FIX: Fetch requester info BEFORE deleting from queue
+  const { rows: requesterRows } = await pool.query(
+    "SELECT username, nickname, avatar, gender, location, interests FROM users WHERE id = $1",
+    [userId]
+  );
+
+  // 3. Delete from queue
   await pool.query("DELETE FROM queue WHERE user_id = ANY($1::text[])", [[userId, peerId]]).catch(() => {});
 
-  // ------------------- FIX: USE ONLINE SOCKET MAP -------------------
+  // 4. Emit to Peer
   const peerSocketId = onlineSockets.get(String(peerId));
   if (peerSocketId) {
     io.to(peerSocketId).emit("match_found", {
       peerId: userId,
-      channel: channelName,
-      peerInfo: {
-        username: rows[0].username,
-        nickname: rows[0].nickname,
-        avatar: rows[0].avatar,
-        gender: rows[0].gender,
-        location: rows[0].location,
-        interests: rows[0].interests,
-      },
-    });
-  }
-  // ------------------------------------------------------------------
-
-  const requesterSocketId = onlineSockets.get(String(userId));
-  if (requesterSocketId) {
-    // Get user info for the requester
-    const { rows: requesterRows } = await pool.query(
-      "SELECT username, nickname, avatar, gender, location, interests FROM users u JOIN queue q ON u.id = q.user_id WHERE u.id = $1",
-      [userId]
-    );
-
-    io.to(requesterSocketId).emit("match_found", {
-      peerId,
       channel: channelName,
       peerInfo: {
         username: requesterRows[0]?.username,
@@ -1121,6 +1092,23 @@ async function tryFindMatch(userId, genderPref, locationPref, interests = []) {
         gender: requesterRows[0]?.gender,
         location: requesterRows[0]?.location,
         interests: requesterRows[0]?.interests,
+      },
+    });
+  }
+
+  // 5. Emit to Requester
+  const requesterSocketId = onlineSockets.get(String(userId));
+  if (requesterSocketId) {
+    io.to(requesterSocketId).emit("match_found", {
+      peerId,
+      channel: channelName,
+      peerInfo: {
+        username: rows[0].username,
+        nickname: rows[0].nickname,
+        avatar: rows[0].avatar,
+        gender: rows[0].gender,
+        location: rows[0].location,
+        interests: rows[0].interests,
       },
     });
   }
