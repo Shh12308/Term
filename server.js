@@ -90,7 +90,10 @@ const pool = new pg.Pool({
   connectionTimeoutMillis: 2000,
 });
 
-const JWT_SECRET = process.env.JWT_SECRET || "super_secret_jwt_key";
+if (!process.env.JWT_SECRET) {
+  throw new Error("JWT_SECRET is required");
+}
+const JWT_SECRET = process.env.JWT_SECRET;
 const OPENAI = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY || "",
   timeout: 30000,
@@ -322,7 +325,13 @@ async function requireAuth(req, res, next) {
   if (!authHeader) return res.status(401).json({ error: "Missing token" });
   const token = authHeader.replace(/^Bearer\s*/i, "");
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
+    catch (err) {
+  if (err.name === "TokenExpiredError") {
+    socket.emit("error", { message: "Session expired" });
+  } else {
+    socket.emit("error", { message: "Authentication failed" });
+  }
+}
 
     // Check cache first
     const cachedUser = userCache.get(`user:${decoded.id}`);
@@ -342,40 +351,6 @@ async function requireAuth(req, res, next) {
     return res.status(401).json({ error: "Invalid token" });
   }
 }
-
-// ------------------- OAUTH ROUTES -------------------
-app.get("/auth/google", authLimiter, passport.authenticate("google", { scope: ["profile", "email"] }));
-app.get(
-  "/auth/google/callback",
-  authLimiter,
-  passport.authenticate("google", { failureRedirect: "/auth/failure", session: true }),
-  (req, res) => {
-    const token = signJwtForUser(req.user);
-    res.redirect(`${process.env.FRONTEND_URL || "/"}?token=${token}`);
-  }
-);
-
-app.get("/auth/discord", authLimiter, passport.authenticate("discord"));
-app.get(
-  "/auth/discord/callback",
-  authLimiter,
-  passport.authenticate("discord", { failureRedirect: "/auth/failure", session: true }),
-  (req, res) => {
-    const token = signJwtForUser(req.user);
-    res.redirect(`${process.env.FRONTEND_URL || "/"}?token=${token}`);
-  }
-);
-
-app.get("/auth/facebook", authLimiter, passport.authenticate("facebook", { scope: ["email"] }));
-app.get(
-  "/auth/facebook/callback",
-  authLimiter,
-  passport.authenticate("facebook", { failureRedirect: "/auth/failure", session: true }),
-  (req, res) => {
-    const token = signJwtForUser(req.user);
-    res.redirect(`${process.env.FRONTEND_URL || "/"}?token=${token}`);
-  }
-);
 
 app.get("/auth/me", async (req, res) => {
   try {
@@ -446,7 +421,13 @@ io.on("connection", (socket) => {
         return socket.emit("error", { message: "Authentication token required" });
       }
 
-      const decoded = jwt.verify(token, JWT_SECRET);
+      catch (err) {
+  if (err.name === "TokenExpiredError") {
+    socket.emit("error", { message: "Session expired" });
+  } else {
+    socket.emit("error", { message: "Authentication failed" });
+  }
+}
       
       // Fetch user from DB or Cache
       let user = userCache.get(`user:${decoded.id}`);
@@ -539,10 +520,10 @@ io.on("connection", (socket) => {
       });
 
       const flagged =
-        mod.results?.[0]?.categories?.sexual ||
-        mod.results?.[0]?.categories?.hate ||
-        mod.results?.[0]?.categories?.violence ||
-        mod.results?.[0]?.flagged;
+        mod.data?.[0]?.categories?.sexual ||
+        mod.data?.[0]?.categories?.hate ||
+        mod.date?.[0]?.categories?.violence ||
+        mod.data?.[0]?.flagged;
 
       if (flagged) {
         const banReason = `Inappropriate message: ${mod.results[0].category_scores}`;
