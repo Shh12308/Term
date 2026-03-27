@@ -323,13 +323,36 @@ function signJwtForUser(user) {
 async function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization || req.body.token || req.query.token;
   if (!authHeader) return res.status(401).json({ error: "Missing token" });
+
   const token = authHeader.replace(/^Bearer\s*/i, "");
+
+  let decoded;
   try {
-    catch (err) {
-  if (err.name === "TokenExpiredError") {
-    socket.emit("error", { message: "Session expired" });
-  } else {
-    socket.emit("error", { message: "Authentication failed" });
+    decoded = jwt.verify(token, JWT_SECRET);
+  } catch (err) {
+    return res.status(401).json({
+      error: err.name === "TokenExpiredError" ? "Token expired" : "Invalid token",
+    });
+  }
+
+  try {
+    // Check cache first
+    const cachedUser = userCache.get(`user:${decoded.id}`);
+    if (cachedUser) {
+      req.user = cachedUser;
+      return next();
+    }
+
+    const { rows } = await pool.query("SELECT * FROM users WHERE id=$1", [decoded.id]);
+    if (!rows[0]) return res.status(401).json({ error: "User not found" });
+
+    userCache.set(`user:${decoded.id}`, rows[0]);
+    req.user = rows[0];
+
+    next();
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Auth error" });
   }
 }
 
@@ -413,52 +436,40 @@ async function detectSuspiciousBehavior(userId, action, metadata = {}) {
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
-  // ------------------- FIX: SOCKET AUTH HANDLER -------------------
-  // Frontend emits 'auth' event with token. We handle it here.
   socket.on("auth", async ({ token }) => {
-    try {
-      if (!token) {
-        return socket.emit("error", { message: "Authentication token required" });
-      }
-
-      catch (err) {
-  if (err.name === "TokenExpiredError") {
-    socket.emit("error", { message: "Session expired" });
-  } else {
-    socket.emit("error", { message: "Authentication failed" });
-  }
-}
-      
-      // Fetch user from DB or Cache
-      let user = userCache.get(`user:${decoded.id}`);
-      if (!user) {
-        const { rows } = await pool.query("SELECT * FROM users WHERE id=$1", [decoded.id]);
-        if (rows[0]) {
-            user = rows[0];
-            userCache.set(`user:${decoded.id}`, user);
-        } else {
-            throw new Error("User not found");
-        }
-      }
-
-      // Attach user info to socket
-      socket.data.userId = user.id;
-      socket.data.user = user;
-      
-      // Register in online sockets map
-      onlineSockets.set(String(user.id), socket.id);
-      
-      console.log(`User ${user.username} authenticated on socket ${socket.id}`);
-      
-      // Notify client they are authenticated
-      socket.emit("authenticated", { userId: user.id });
-
-    } catch (err) {
-      console.error("Socket auth error:", err.message);
-      // Don't necessarily disconnect, but restrict actions
-      socket.emit("error", { message: "Authentication failed" });
+  try {
+    if (!token) {
+      return socket.emit("error", { message: "Authentication token required" });
     }
-  });
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    let user = userCache.get(`user:${decoded.id}`);
+    if (!user) {
+      const { rows } = await pool.query("SELECT * FROM users WHERE id=$1", [decoded.id]);
+      if (!rows[0]) throw new Error("User not found");
+
+      user = rows[0];
+      userCache.set(`user:${decoded.id}`, user);
+    }
+
+    socket.data.userId = user.id;
+    socket.data.user = user;
+
+    onlineSockets.set(String(user.id), socket.id);
+
+    socket.emit("authenticated", { userId: user.id });
+
+  } catch (err) {
+    console.error("Socket auth error:", err.message);
+
+    socket.emit("error", {
+      message: err.name === "TokenExpiredError"
+        ? "Session expired"
+        : "Authentication failed",
+    });
+  }
+});
   // ----------------------------------------------------------------
 
   // JOIN ROOM (Basic)
@@ -522,7 +533,7 @@ io.on("connection", (socket) => {
       const flagged =
         mod.data?.[0]?.categories?.sexual ||
         mod.data?.[0]?.categories?.hate ||
-        mod.date?.[0]?.categories?.violence ||
+        mod.data?.[0]?.categories?.violence ||
         mod.data?.[0]?.flagged;
 
       if (flagged) {
@@ -1353,83 +1364,7 @@ app.post("/user/display-name", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Could not update name" });
   }
 });
-
-app.post("/auth/exchange", async (req, res) => {
-  const { code, provider } = req.body;
-
-  if (!code || !provider) {
-    return res.status(400).json({ error: "Missing code or provider" });
-  }
-
-  try {
-    let tokenResponse;
-    switch (provider.toLowerCase()) {
-      case "discord":
-        tokenResponse = await fetch("https://discord.com/api/oauth2/token", {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({
-            client_id: process.env.DISCORD_CLIENT_ID,
-            client_secret: process.env.DISCORD_CLIENT_SECRET,
-            grant_type: "authorization_code",
-            code,
-            redirect_uri: "https://yourdomain.com/callback.html",
-          })
-        });
-        break;
-
-      case "google":
-        tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({
-            client_id: process.env.GOOGLE_CLIENT_ID,
-            client_secret: process.env.GOOGLE_CLIENT_SECRET,
-            grant_type: "authorization_code",
-            code,
-            redirect_uri: "https://yourdomain.com/callback.html",
-          })
-        });
-        break;
-
-      case "facebook":
-        tokenResponse = await fetch(`https://graph.facebook.com/v16.0/oauth/access_token?` +
-          new URLSearchParams({
-            client_id: process.env.FACEBOOK_APP_ID,
-            client_secret: process.env.FACEBOOK_APP_SECRET,
-            redirect_uri: "https://yourdomain.com/callback.html",
-            code,
-          })
-        );
-        break;
-
-      default:
-        return res.status(400).json({ error: "Unknown provider" });
-    }
-
-    const tokenData = await tokenResponse.json();
-    if (!tokenData.access_token) {
-      return res.status(400).json({ error: "Failed to get access token", details: tokenData });
-    }
-
-    // Optionally: fetch user info from provider
-    // e.g., Discord: https://discord.com/api/users/@me
-
-    // Issue your own JWT token for frontend usage
-    const jwtToken = jwt.sign(
-      { provider, accessToken: tokenData.access_token },
-      JWT_SECRET,
-      { expiresIn: "7d" }
-    );
-
-    res.json({ token: jwtToken });
-
-  } catch (err) {
-    console.error("Auth exchange error:", err);
-    res.status(500).json({ error: "Server error", details: err.message });
-  }
-});
-
+  
 app.get("/user/profile", requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(
