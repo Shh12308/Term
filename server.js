@@ -343,8 +343,14 @@ async function requireAuth(req, res, next) {
       return next();
     }
 
-    const { rows } = await pool.query("SELECT * FROM users WHERE id=$1", [decoded.id]);
-    if (!rows[0]) return res.status(401).json({ error: "User not found" });
+    const { rows } = await pool.query(
+      "SELECT * FROM users WHERE id=$1",
+      [decoded.id]
+    );
+
+    if (!rows[0]) {
+      return res.status(401).json({ error: "User not found" });
+    }
 
     userCache.set(`user:${decoded.id}`, rows[0]);
     req.user = rows[0];
@@ -353,25 +359,6 @@ async function requireAuth(req, res, next) {
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Auth error" });
-  }
-}
-
-    // Check cache first
-    const cachedUser = userCache.get(`user:${decoded.id}`);
-    if (cachedUser) {
-      req.user = cachedUser;
-      return next();
-    }
-
-    const { rows } = await pool.query("SELECT * FROM users WHERE id=$1", [decoded.id]);
-    if (!rows[0]) return res.status(401).json({ error: "User not found" });
-
-    // Cache the user
-    userCache.set(`user:${decoded.id}`, rows[0]);
-    req.user = rows[0];
-    next();
-  } catch (err) {
-    return res.status(401).json({ error: "Invalid token" });
   }
 }
 
