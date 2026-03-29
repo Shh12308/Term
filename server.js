@@ -373,7 +373,7 @@ app.get(
   passport.authenticate("facebook", { failureRedirect: "/auth/failure", session: true }),
   (req, res) => {
     const token = signJwtForUser(req.user);
-    res.redirect(`${process.env.FRONTEND_URL || "/"}?token=${token}`);
+    res.redirect(`${process.env.FRONTEND_URL || "https://omevo.online"}/achat.html?token=${token}`);
   }
 );
 
