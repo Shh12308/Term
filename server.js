@@ -362,7 +362,7 @@ app.get(
   passport.authenticate("discord", { failureRedirect: "/auth/failure", session: true }),
   (req, res) => {
     const token = signJwtForUser(req.user);
-    res.redirect(`${process.env.FRONTEND_URL || "/"}?token=${token}`);
+    res.redirect(`${process.env.FRONTEND_URL || "/achat"}?token=${token}`);
   }
 );
 
