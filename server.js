@@ -355,14 +355,18 @@ app.get(
   }
 );
 
-app.get("/auth/discord", authLimiter, passport.authenticate("discord"));
 app.get(
   "/auth/discord/callback",
   authLimiter,
   passport.authenticate("discord", { failureRedirect: "/auth/failure", session: true }),
   (req, res) => {
+    // Generate JWT for the logged-in user
     const token = signJwtForUser(req.user);
-    res.redirect(`${process.env.FRONTEND_URL || "/"}?token=${token}`);
+
+    // Redirect user to your frontend achat page with the token
+    const redirectUrl = `${process.env.FRONTEND_URL || "https://omevo.online"}/achat.html?token=${token}`;
+
+    res.redirect(redirectUrl);
   }
 );
 
