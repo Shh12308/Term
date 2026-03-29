@@ -343,77 +343,50 @@ async function requireAuth(req, res, next) {
   }
 }
 
-// ------------------- OAUTH ROUTES WITH AGE -------------------
+// ------------------- OAUTH ROUTES -------------------
 app.get("/auth/google", authLimiter, passport.authenticate("google", { scope: ["profile", "email"] }));
-
 app.get(
   "/auth/google/callback",
   authLimiter,
   passport.authenticate("google", { failureRedirect: "/auth/failure", session: true }),
-  async (req, res) => {
-    // If age is not set, redirect to age collection page
-    if (!req.user.age) {
-      const token = signJwtForUser(req.user);
-      return res.redirect(`${process.env.FRONTEND_URL || "/"}?token=${token}&collectAge=true`);
-    }
+  (req, res) => {
     const token = signJwtForUser(req.user);
     res.redirect(`${process.env.FRONTEND_URL || "/"}?token=${token}`);
   }
 );
 
 app.get("/auth/discord", authLimiter, passport.authenticate("discord"));
-
 app.get(
-  "/auth/discord/callback",
+  "/auth/discord/achat",
   authLimiter,
   passport.authenticate("discord", { failureRedirect: "/auth/failure", session: true }),
-  async (req, res) => {
-    if (!req.user.age) {
-      const token = signJwtForUser(req.user);
-      return res.redirect(`${process.env.FRONTEND_URL || "/"}?token=${token}&collectAge=true`);
-    }
+  (req, res) => {
     const token = signJwtForUser(req.user);
     res.redirect(`${process.env.FRONTEND_URL || "/achat"}?token=${token}`);
   }
 );
 
 app.get("/auth/facebook", authLimiter, passport.authenticate("facebook", { scope: ["email"] }));
-
 app.get(
   "/auth/facebook/callback",
   authLimiter,
   passport.authenticate("facebook", { failureRedirect: "/auth/failure", session: true }),
-  async (req, res) => {
-    if (!req.user.age) {
-      const token = signJwtForUser(req.user);
-      return res.redirect(`${process.env.FRONTEND_URL || "https://omevo.online"}/achat.html?token=${token}&collectAge=true`);
-    }
+  (req, res) => {
     const token = signJwtForUser(req.user);
     res.redirect(`${process.env.FRONTEND_URL || "https://omevo.online"}/achat.html?token=${token}`);
   }
 );
 
-// ------------------- UPDATE AGE ENDPOINT -------------------
-app.post("/auth/update-age", authLimiter, async (req, res) => {
+app.get("/auth/me", async (req, res) => {
   try {
     await requireAuth(req, res, async () => {
-      const { age } = req.body;
-      if (!age || isNaN(age) || age < 0 || age > 120) {
-        return res.status(400).json({ error: "Invalid age" });
-      }
-
-      // Update user in DB
-      await pool.query("UPDATE users SET age=$1 WHERE id=$2", [age, req.user.id]);
-
-      // Update JWT with new age
-      const updatedUser = { ...req.user, age };
-      const token = signJwtForUser(updatedUser);
-
-      res.json({ success: true, token });
+      return res.json({
+        authenticated: true,
+        user: req.user,
+      });
     });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to update age" });
+  } catch {
+    res.json({ authenticated: false });
   }
 });
 
