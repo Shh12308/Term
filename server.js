@@ -346,12 +346,12 @@ async function requireAuth(req, res, next) {
 // ------------------- OAUTH ROUTES -------------------
 app.get("/auth/google", authLimiter, passport.authenticate("google", { scope: ["profile", "email"] }));
 app.get(
-  "/auth/google/callback",
+  "/auth/google/achat",
   authLimiter,
   passport.authenticate("google", { failureRedirect: "/auth/failure", session: true }),
   (req, res) => {
     const token = signJwtForUser(req.user);
-    res.redirect(`${process.env.FRONTEND_URL || "/"}?token=${token}`);
+    res.redirect(`${process.env.FRONTEND_URL || "/achat"}?token=${token}`);
   }
 );
 
