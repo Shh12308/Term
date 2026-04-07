@@ -13,11 +13,9 @@ import agora from "agora-access-token";
 import CoinbaseCommerce from "coinbase-commerce-node";
 import rateLimit from "express-rate-limit";
 import helmet from "helmet";
-import Redis from "ioredis";
 import NodeCache from "node-cache";
 import cron from "node-cron";
 import sharp from "sharp";
-import { createHash } from "crypto";
 
 import { Strategy as GoogleStrategy } from "passport-google-oauth20";
 import { Strategy as DiscordStrategy } from "passport-discord";
@@ -50,9 +48,6 @@ app.use(
     origin: process.env.FRONTEND_URL,
   })
 );
-
-// Matchmaking queue (global)
-const waitingQueue = [];
 
 // Rate limiting
 const generalLimiter = rateLimit({
@@ -289,23 +284,6 @@ passport.use(
   )
 );
 
-async function findMatch(user) {
-  if (waitingQueue.length > 0) {
-    const partner = waitingQueue.shift();
-
-    const channel = "room_" + Date.now();
-
-    return {
-      userA: user.id,
-      userB: partner.id,
-      channel,
-    };
-  } else {
-    waitingQueue.push(user);
-    return null;
-  }
-}
-
 // ------------------- JWT HELPER -------------------
 function signJwtForUser(user) {
   const payload = {
@@ -399,8 +377,6 @@ const roomParticipants = new Map(); // Track participants in each room
 
 function requireSocketUser(socket) {
   if (!socket.data.userId) {
-    // Only disconnect if trying to perform restricted actions, not immediately on connection
-    // But for safety in restricted routes:
     return null;
   }
   return socket.data.userId;
@@ -438,7 +414,6 @@ async function detectSuspiciousBehavior(userId, action, metadata = {}) {
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
-  // ------------------- FIX: SOCKET AUTH HANDLER -------------------
   // Frontend emits 'auth' event with token. We handle it here.
   socket.on("auth", async ({ token }) => {
     try {
@@ -474,11 +449,9 @@ io.on("connection", (socket) => {
 
     } catch (err) {
       console.error("Socket auth error:", err.message);
-      // Don't necessarily disconnect, but restrict actions
       socket.emit("error", { message: "Authentication failed" });
     }
   });
-  // ----------------------------------------------------------------
 
   // JOIN ROOM (Basic)
   socket.on("join", async ({ room, uid, name }) => {
@@ -499,7 +472,6 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     console.log("User disconnected:", socket.id);
     
-    // ------------------- FIX: CLEANUP REGISTRY -------------------
     // Remove user from onlineSockets map
     if (socket.data.userId) {
         onlineSockets.delete(String(socket.data.userId));
@@ -507,10 +479,9 @@ io.on("connection", (socket) => {
         // Optional: Leave queue on disconnect
         pool.query("DELETE FROM queue WHERE user_id=$1", [String(socket.data.userId)]).catch(() => {});
     }
-    // -------------------------------------------------------------
   });
 
-  // Updated to match frontend (Detailed Message Handler)
+  // Detailed Message Handler
   socket.on("message", async ({ room, text }) => {
     const uid = requireSocketUser(socket);
     if (!uid) return socket.emit("error", { message: "Not authenticated" });
@@ -596,7 +567,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Added to match frontend
   socket.on("name-update", async ({ room, name }) => {
     const uid = requireSocketUser(socket);
     if (!uid) return;
@@ -628,7 +598,6 @@ io.on("connection", (socket) => {
   });
 
   // Video Frame Logic
-  // Note: Using let inside the connection scope ensures this variable is unique per connected socket
   let lastFrameModeration = 0;
 
   socket.on("video_frame", async ({ frameBase64, roomId }) => {
@@ -670,7 +639,7 @@ io.on("connection", (socket) => {
       const flagged =
         result?.flagged || result?.categories?.sexual || result?.categories?.violence || result?.categories?.hate;
 
-      // 🚨 ONLY RUN BAN LOGIC IF FLAGGED
+      // ONLY RUN BAN LOGIC IF FLAGGED
       if (flagged) {
         const banReason = `Inappropriate content detected`;
 
@@ -695,7 +664,7 @@ io.on("connection", (socket) => {
         return;
       }
 
-      // ✅ Forward frame to the other user
+      // Forward frame to the other user
       const targetRoom = roomId || userRoom[0];
       const participants = roomParticipants.get(targetRoom) || [];
 
@@ -913,7 +882,7 @@ app.post("/api/create-checkout-session", requireAuth, async (req, res) => {
   try {
     const { coins, price } = req.body;
 
-    // FIX: Use Environment Variable instead of hardcoded key
+    // Use Environment Variable instead of hardcoded key
     const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY); 
 
     const session = await stripe.checkout.sessions.create({
@@ -977,6 +946,9 @@ app.post("/api/verify-payment", requireAuth, async (req, res) => {
         [userId, coins, session.amount_total / 100, sessionId]
       );
 
+      // Invalidate cache for user
+      userCache.del(`user:${userId}`);
+
       res.json({
         success: true,
         coins: rows[0].coins,
@@ -1036,6 +1008,9 @@ app.post("/api/user/spend-coins", requireAuth, async (req, res) => {
       "INSERT INTO coin_transactions (user_id, coins, amount, transaction_type, gift_type, recipient_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, NOW())",
       [req.user.id, -coins, 0, type, giftType, recipientId]
     );
+    
+    // Invalidate cache
+    userCache.del(`user:${req.user.id}`);
 
     res.json({ success: true });
   } catch (error) {
@@ -1072,7 +1047,7 @@ async function tryFindMatch(userId, genderPref, locationPref, interests = []) {
     channelName,
   ]);
 
-  // 2. FIX: Fetch requester info BEFORE deleting from queue
+  // 2. Fetch requester info BEFORE deleting from queue
   const { rows: requesterRows } = await pool.query(
     "SELECT username, nickname, avatar, gender, location, interests FROM users WHERE id = $1",
     [userId]
@@ -1265,8 +1240,7 @@ app.post("/queue/enqueue", requireAuth, async (req, res) => {
   }
 });
 
-// ------------------- FIX: QUEUE CHECK ENDPOINT -------------------
-// Frontend polls this if no immediate match is found
+// QUEUE CHECK ENDPOINT
 app.get("/queue/check", requireAuth, async (req, res) => {
   try {
     const userId = String(req.user.id);
@@ -1298,7 +1272,6 @@ app.get("/queue/check", requireAuth, async (req, res) => {
     res.status(500).json({ error: "queue check failed" });
   }
 });
-// ----------------------------------------------------------------
 
 app.post("/queue/leave", requireAuth, async (req, res) => {
   try {
@@ -1341,7 +1314,6 @@ app.post("/generateToken", requireAuth, async (req, res) => {
   }
 });
 
-// Fixed to match frontend
 app.post("/user/display-name", requireAuth, async (req, res) => {
   try {
     const { display_name } = req.body;
@@ -1384,10 +1356,10 @@ app.get("/user/profile", requireAuth, async (req, res) => {
 
     if (!rows.length) return res.status(404).json({ error: "User not found" });
 
-    const user = rows[0]; // ✅ define it
+    const user = rows[0]; 
 
-    // ✅ cache user in Redis
-    await redis.set(`user:${user.id}`, JSON.stringify(user), "EX", 300);
+    // FIX: Use userCache instead of undefined redis
+    userCache.set(`user:${user.id}`, user);
 
     res.json({
       ...user,
@@ -1628,7 +1600,6 @@ app.post("/api/admin/appeals/:id/respond", requireAuth, async (req, res) => {
 });
 
 // ------------------- ADMIN USER MANAGEMENT -------------------
-// Added to match frontend
 app.get("/api/admin/users", requireAuth, async (req, res) => {
   try {
     // Check if user is admin
@@ -1656,7 +1627,6 @@ app.get("/api/admin/users", requireAuth, async (req, res) => {
   }
 });
 
-// Added to match frontend
 app.post("/api/admin/ban", requireAuth, async (req, res) => {
   try {
     // Check if user is admin
@@ -1706,7 +1676,6 @@ app.post("/api/admin/ban", requireAuth, async (req, res) => {
   }
 });
 
-// Added to match frontend
 app.post("/api/admin/unban", requireAuth, async (req, res) => {
   try {
     // Check if user is admin
