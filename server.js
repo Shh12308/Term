@@ -329,18 +329,18 @@ app.get(
   passport.authenticate("google", { failureRedirect: "/auth/failure", session: true }),
   (req, res) => {
     const token = signJwtForUser(req.user);
-    res.redirect(`${process.env.FRONTEND_URL || "/achat"}?token=${token}`);
+    res.redirect(`${process.env.FRONTEND_URL || "/video"}?token=${token}`);
   }
 );
 
 app.get("/auth/discord", authLimiter, passport.authenticate("discord"));
 app.get(
-  "/auth/discord/achat",
+  "/auth/discord/video",
   authLimiter,
   passport.authenticate("discord", { failureRedirect: "/auth/failure", session: true }),
   (req, res) => {
     const token = signJwtForUser(req.user);
-    res.redirect(`${process.env.FRONTEND_URL || "/achat"}?token=${token}`);
+    res.redirect(`${process.env.FRONTEND_URL || "/video"}?token=${token}`);
   }
 );
 
@@ -351,7 +351,7 @@ app.get(
   passport.authenticate("facebook", { failureRedirect: "/auth/failure", session: true }),
   (req, res) => {
     const token = signJwtForUser(req.user);
-    res.redirect(`${process.env.FRONTEND_URL || "https://omevo.online"}/achat.html?token=${token}`);
+    res.redirect(`${process.env.FRONTEND_URL || "https://omevo.online"}/video?token=${token}`);
   }
 );
 
