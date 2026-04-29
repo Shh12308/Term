@@ -925,6 +925,37 @@ app.post("/api/verify-payment", requireAuth, async (req, res) => {
 // Ensure all required columns exist
 async function ensureColumns() {
   try {
+    await pool.query(`
+  CREATE TABLE IF NOT EXISTS appeals (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id),
+    message TEXT NOT NULL,
+    status VARCHAR(20) DEFAULT 'pending',
+    admin_response TEXT,
+    admin_id INTEGER,
+    created_at TIMESTAMP DEFAULT NOW(),
+    reviewed_at TIMESTAMP
+  )
+`);
+    await pool.query(`
+  ALTER TABLE appeals 
+  ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'pending'
+`);
+
+await pool.query(`
+  ALTER TABLE appeals 
+  ADD COLUMN IF NOT EXISTS admin_response TEXT
+`);
+
+await pool.query(`
+  ALTER TABLE appeals 
+  ADD COLUMN IF NOT EXISTS admin_id INTEGER
+`);
+
+await pool.query(`
+  ALTER TABLE appeals 
+  ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP
+`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS coins INTEGER DEFAULT 0`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS looking_for VARCHAR(20) DEFAULT 'any'`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'user'`);
