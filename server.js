@@ -459,10 +459,30 @@ app.get(
 );
 
 app.get("/auth/me", requireAuth, async (req, res) => {
-  res.json({
-    authenticated: true,
-    user: req.user,
-  });
+  try {
+    const { rows } = await pool.query(
+      `SELECT *, 
+       GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (NOW() - created_at)) / 3600)) as level
+       FROM users WHERE id=$1`, 
+      [req.user.id]
+    );
+    
+    let user = rows[0];
+    
+    // Ensure location is set via IP on login
+    if (!user.location || user.location === 'any') {
+      const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress;
+      const geo = geoip.lookup(ip);
+      const loc = geo?.country?.toLowerCase() || "any";
+      await pool.query("UPDATE users SET location=$1 WHERE id=$2", [loc, req.user.id]);
+      user.location = loc;
+    }
+
+    userCache.set(`user:${req.user.id}`, user);
+    res.json({ authenticated: true, user: user });
+  } catch (err) {
+    res.status(500).json({ error: "Auth check failed" });
+  }
 });
 
 app.get("/auth/failure", (req, res) => res.status(401).json({ error: "Authentication failed" }));
@@ -764,6 +784,28 @@ io.on("connection", (socket) => {
           reason: banReason,
         });
 
+        socket.disconnect(true);
+        return;
+      }
+
+            if (flagged) {
+        const banReason = `Inappropriate content detected`;
+        await pool.query("UPDATE users SET banned_until = NOW() + INTERVAL '750 hours', ban_reason=$1 WHERE id=$2", [
+          banReason, userId,
+        ]);
+        await pool.query("INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())", [
+          userId, "auto_ban", banReason,
+        ]);
+        userCache.del(`user:${userId}`);
+
+        // FIX: Send the offending frame so the frontend can show it in the ban overlay
+        socket.emit("moderation_action", {
+          type: "video",
+          banned: true,
+          duration_hours: BAN_HOURS,
+          reason: banReason,
+          offendingFrame: processedBase64 
+        });
         socket.disconnect(true);
         return;
       }
@@ -1192,18 +1234,6 @@ async function tryFindMatch(userId, genderPref, lookingForPref, locationPref, in
 }
 
 // ------------------- USER PREFERENCES -------------------
-app.get("/api/user/preferences", requireAuth, async (req, res) => {
-  try {
-    const { rows } = await pool.query("SELECT gender, looking_for, location, interests, age_verified FROM users WHERE id = $1", [
-      req.user.id,
-    ]);
-    if (!rows.length) return res.status(404).json({ error: "User not found" });
-    res.json(rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Could not fetch preferences" });
-  }
-});
 
 app.post("/api/user/preferences", requireAuth, async (req, res) => {
   try {
@@ -1438,15 +1468,14 @@ app.get("/user/profile", requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, username, email, provider, avatar, gender, looking_for, location,
-       interests, nickname, display_name, age_verified, created_at, updated_at, coins, role
+       interests, nickname, display_name, age_verified, created_at, updated_at, coins, role,
+       GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (NOW() - created_at)) / 3600)) as level
        FROM users WHERE id=$1`,
       [req.user.id]
     );
 
     if (!rows.length) return res.status(404).json({ error: "User not found" });
-
     const user = rows[0];
-
     userCache.set(`user:${user.id}`, user);
 
     res.json({
@@ -1455,7 +1484,6 @@ app.get("/user/profile", requireAuth, async (req, res) => {
       is_admin: user.role === "admin",
     });
   } catch (err) {
-    console.error("Profile fetch error:", err);
     res.status(500).json({ error: "Could not fetch profile" });
   }
 });
@@ -1538,6 +1566,36 @@ app.post("/api/pay-unban", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Coinbase payment creation failed" });
+  }
+});
+
+app.post("/api/create-gift-checkout", requireAuth, async (req, res) => {
+  try {
+    if (!stripe) return res.status(503).json({ error: "Payment system unavailable" });
+    const { giftType, recipientId } = req.body; // e.g., giftType: "rose", "bear"
+
+    const giftPrices = { rose: 2.99, bear: 4.99, lion: 9.99 };
+    const price = giftPrices[giftType] || 2.99;
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ["card"],
+      line_items: [{
+        price_data: {
+          currency: "usd",
+          product_data: { name: `Virtual ${giftType} Gift`, description: `Sent to user ${recipientId}` },
+          unit_amount: Math.round(price * 100),
+        },
+        quantity: 1,
+      }],
+      mode: "payment",
+      success_url: `${process.env.FRONTEND_URL}?gift=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_URL}?gift=cancelled`,
+      customer_email: req.user.email,
+      metadata: { userId: String(req.user.id), recipientId: String(recipientId), giftType },
+    });
+    res.json({ url: session.url });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to create gift payment" });
   }
 });
 
