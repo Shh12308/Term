@@ -1759,6 +1759,11 @@ cron.schedule("0 3 * * *", async () => {
   }
 });
 
+socket.on("connect_error", (err) => {
+  console.error("Socket connect error:", err);
+  showToast("Connection failed", "error");
+});
+
 // ------------------- START SERVER -------------------
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
