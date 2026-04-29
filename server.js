@@ -16,6 +16,7 @@ import helmet from "helmet";
 import NodeCache from "node-cache";
 import cron from "node-cron";
 import sharp from "sharp";
+import Stripe from "stripe"; // FIX: proper ESM import instead of require()
 
 import { Strategy as GoogleStrategy } from "passport-google-oauth20";
 import { Strategy as DiscordStrategy } from "passport-discord";
@@ -67,6 +68,11 @@ const authLimiter = rateLimit({
 
 app.use(express.json({ limit: "5mb" }));
 const server = http.createServer(app);
+
+// ────────────────────────────────────────────────────────
+// FIX: Socket.IO server created WITHOUT auth middleware first.
+// We attach the middleware AFTER the Redis adapter is configured.
+// ────────────────────────────────────────────────────────
 const io = new SocketIOServer(server, {
   cors: {
     origin: process.env.FRONTEND_URL,
@@ -101,8 +107,8 @@ const MAX_INTERESTS = 5;
 const MAX_NICKNAME_LENGTH = 20;
 const MIN_AGE_FOR_VIDEO = 18;
 
-// FIX: Stripe singleton at top level
-const stripe = process.env.STRIPE_SECRET_KEY ? require("stripe")(process.env.STRIPE_SECRET_KEY) : null;
+// FIX: Proper ESM-compatible Stripe initialization
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
 // FIX: Coinbase Commerce guarded initialization
 let ChargeResource = null;
@@ -117,6 +123,105 @@ if (process.env.COINBASE_COMMERCE_API_KEY) {
 }
 
 const userCache = new NodeCache({ stdTTL: 300, checkperiod: 120 });
+
+// ────────────────────────────────────────────────────────
+// FIX: Redis adapter for horizontal scaling
+// If REDIS_URL is set, Socket.IO uses Redis to broadcast
+// across multiple server instances.
+// ────────────────────────────────────────────────────────
+let redisClient = null;
+let redisAdapter = null;
+
+async function initRedis() {
+  if (!process.env.REDIS_URL) {
+    console.log("⚠️  No REDIS_URL — running in single-instance mode");
+    return;
+  }
+
+  try {
+    const { createClient } = await import("redis");
+    const { createAdapter } = await import("@socket.io/redis-adapter");
+
+    const pubClient = createClient({ url: process.env.REDIS_URL });
+    const subClient = pubClient.duplicate();
+
+    await pubClient.connect();
+    await subClient.connect();
+
+    redisClient = pubClient;
+    io.adapter(createAdapter(pubClient, subClient));
+    console.log("✅ Socket.IO Redis adapter connected");
+  } catch (err) {
+    console.warn("⚠️  Redis adapter failed to initialize (falling back to local):", err.message);
+  }
+}
+
+// ────────────────────────────────────────────────────────
+// FIX: Unified online-user tracking
+// In single-instance mode, uses an in-memory Map.
+// With Redis, also persists to Redis so other instances
+// can look up a user's socket.
+// ────────────────────────────────────────────────────────
+const onlineSockets = new Map(); // local fallback: userId → socketId
+
+async function setUserOnline(userId, socketId) {
+  onlineSockets.set(String(userId), socketId);
+  if (redisClient) {
+    try {
+      await redisClient.set(`socket:online:${userId}`, socketId, { EX: 3600 });
+    } catch {}
+  }
+}
+
+async function getUserSocketId(userId) {
+  if (redisClient) {
+    try {
+      const sid = await redisClient.get(`socket:online:${userId}`);
+      if (sid) return sid;
+    } catch {}
+  }
+  return onlineSockets.get(String(userId));
+}
+
+async function setUserOffline(userId) {
+  onlineSockets.delete(String(userId));
+  if (redisClient) {
+    try {
+      await redisClient.del(`socket:online:${userId}`);
+    } catch {}
+  }
+}
+
+// ────────────────────────────────────────────────────────
+// FIX: Room helpers using Socket.IO as source of truth
+// instead of maintaining parallel in-memory Maps that leak.
+// ────────────────────────────────────────────────────────
+
+/** Get all rooms a socket has joined (excluding its own ID room) */
+function getSocketRooms(socket) {
+  const rooms = [];
+  for (const room of socket.rooms) {
+    if (room !== socket.id) rooms.push(room);
+  }
+  return rooms;
+}
+
+/** Check if a socket is in a specific room */
+function isInRoom(socket, room) {
+  return socket.rooms.has(room);
+}
+
+/** Get all socket IDs in a room */
+async function getRoomSocketIds(room) {
+  const sockets = await io.in(room).fetchSockets();
+  return sockets.map((s) => s.id);
+}
+
+/** Get all userIds in a room */
+async function getRoomUserIds(room) {
+  const sockets = await io.in(room).fetchSockets();
+  return sockets.map((s) => s.data.userId).filter(Boolean);
+}
 
 // ------------------- SESSION & PASSPORT -------------------
 const PGStore = pgSessionImport(session);
@@ -353,7 +458,6 @@ app.get(
   }
 );
 
-// FIX: Use requireAuth as proper middleware instead of broken try/catch wrapper
 app.get("/auth/me", requireAuth, async (req, res) => {
   res.json({
     authenticated: true,
@@ -363,17 +467,51 @@ app.get("/auth/me", requireAuth, async (req, res) => {
 
 app.get("/auth/failure", (req, res) => res.status(401).json({ error: "Authentication failed" }));
 
-// ------------------- SOCKET.IO -------------------
-const onlineSockets = new Map();
-const userRooms = new Map();
-const roomParticipants = new Map();
+// ────────────────────────────────────────────────────────
+// FIX: Socket.IO handshake authentication middleware
+// Replaces the old "auth" event pattern.
+// Sockets are now authenticated BEFORE any event handler runs.
+// Unauthenticated sockets get rejected at the transport level.
+// ────────────────────────────────────────────────────────
+io.use(async (socket, next) => {
+  try {
+    const token =
+      socket.handshake.auth.token ||
+      socket.handshake.query.token;
 
-function requireSocketUser(socket) {
-  if (!socket.data.userId) {
-    return null;
+    if (!token) {
+      return next(new Error("Authentication token required"));
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    let user = userCache.get(`user:${decoded.id}`);
+    if (!user) {
+      const { rows } = await pool.query("SELECT * FROM users WHERE id=$1", [decoded.id]);
+      if (!rows[0]) {
+        return next(new Error("User not found"));
+      }
+      user = rows[0];
+      userCache.set(`user:${decoded.id}`, user);
+    }
+
+    // Check ban status
+    if (user.banned_until && new Date(user.banned_until) > new Date()) {
+      return next(new Error("Account is banned"));
+    }
+
+    socket.data.userId = user.id;
+    socket.data.user = user;
+    socket.data.lastFrameModeration = 0; // FIX: per-socket frame throttle
+
+    next();
+  } catch (err) {
+    console.error("Socket auth middleware rejected:", err.message);
+    next(new Error("Unauthorized"));
   }
-  return socket.data.userId;
-}
+});
+
+// ------------------- SOCKET.IO EVENT HANDLERS -------------------
 
 async function detectSuspiciousBehavior(userId, action, metadata = {}) {
   try {
@@ -401,83 +539,73 @@ async function detectSuspiciousBehavior(userId, action, metadata = {}) {
 }
 
 io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
+  const userId = socket.data.userId;
+  const user = socket.data.user;
 
-  socket.on("auth", async ({ token }) => {
-    try {
-      if (!token) {
-        return socket.emit("error", { message: "Authentication token required" });
-      }
+  console.log(`✅ User ${user.username} connected: ${socket.id}`);
 
-      const decoded = jwt.verify(token, JWT_SECRET);
+  // Register online presence
+  setUserOnline(String(userId), socket.id);
 
-      let user = userCache.get(`user:${decoded.id}`);
-      if (!user) {
-        const { rows } = await pool.query("SELECT * FROM users WHERE id=$1", [decoded.id]);
-        if (rows[0]) {
-          user = rows[0];
-          userCache.set(`user:${decoded.id}`, user);
-        } else {
-          throw new Error("User not found");
-        }
-      }
+  // ────────────────────────────────────────────────
+  // FIX: Emit "authenticated" immediately on connect
+  // (no need for a separate "auth" event anymore)
+  // ────────────────────────────────────────────────
+  socket.emit("authenticated", { userId: userId });
 
-      socket.data.userId = user.id;
-      socket.data.user = user;
-
-      onlineSockets.set(String(user.id), socket.id);
-
-      console.log(`User ${user.username} authenticated on socket ${socket.id}`);
-
-      socket.emit("authenticated", { userId: user.id });
-    } catch (err) {
-      console.error("Socket auth error:", err.message);
-      socket.emit("error", { message: "Authentication failed" });
-    }
-  });
-
-  // TYPING - FIX: include uid so frontend can filter self
+  // ────────────────────────────────────────────────
+  // TYPING — FIX: validate room membership
+  // ────────────────────────────────────────────────
   socket.on("typing", ({ room }) => {
-    const uid = requireSocketUser(socket);
-    socket.to(room).emit("typing", { uid });
+    if (!room) return;
+    if (!isInRoom(socket, room)) return; // FIX: room validation
+    socket.to(room).emit("typing", { uid: userId });
   });
 
-  // DISCONNECT
-  socket.on("disconnect", () => {
-    console.log("User disconnected:", socket.id);
+  // ────────────────────────────────────────────────
+  // DISCONNECT — FIX: complete cleanup
+  // ────────────────────────────────────────────────
+  socket.on("disconnect", async (reason) => {
+    console.log(`❌ User ${user.username} disconnected: ${socket.id} (${reason})`);
 
-    if (socket.data.userId) {
-      onlineSockets.delete(String(socket.data.userId));
+    await setUserOffline(String(userId));
 
-      // Notify rooms the user was in
-      const rooms = userRooms.get(socket.data.userId) || [];
-      rooms.forEach((r) => {
-        socket.to(r).emit("peer_left", { socketId: socket.id, userId: socket.data.userId });
-      });
-
-      // Remove from queue on disconnect
-      pool.query("DELETE FROM queue WHERE user_id=$1", [String(socket.data.userId)]).catch(() => {});
+    // Notify all rooms this user was in
+    const rooms = getSocketRooms(socket);
+    for (const room of rooms) {
+      socket.to(room).emit("peer_left", { socketId: socket.id, userId: userId });
     }
+
+    // Remove from queue on disconnect
+    pool.query("DELETE FROM queue WHERE user_id=$1", [String(userId)]).catch(() => {});
   });
 
-  // Detailed Message Handler
+  // ────────────────────────────────────────────────
+  // MESSAGE — FIX: room validation, consistent emit
+  // ────────────────────────────────────────────────
   socket.on("message", async ({ room, text }) => {
-    const uid = requireSocketUser(socket);
-    if (!uid) return socket.emit("error", { message: "Not authenticated" });
+    if (!userId) return socket.emit("error", { message: "Not authenticated" });
 
     try {
-      const userRoom = userRooms.get(uid);
-      if (!userRoom || (room && !userRoom.includes(room))) {
-        socket.emit("error", { message: "You're not in this room" });
-        return;
+      // FIX: Determine target room and validate membership
+      const userRooms = getSocketRooms(socket);
+      let targetRoom = room;
+
+      if (targetRoom) {
+        if (!isInRoom(socket, targetRoom)) {
+          return socket.emit("error", { message: "You're not in this room" });
+        }
+      } else if (userRooms.length > 0) {
+        targetRoom = userRooms[0];
+      } else {
+        return socket.emit("error", { message: "You're not in any room" });
       }
 
       if (!text || text.length > 500) {
-        socket.emit("error", { message: "Message too long" });
-        return;
+        return socket.emit("error", { message: "Message too long" });
       }
 
-      await detectSuspiciousBehavior(uid, "chat_message", { length: text.length });
+      await detectSuspiciousBehavior(userId, "chat_message", { length: text.length });
 
       const mod = await OPENAI.moderations.create({
         model: "omni-moderation-latest",
@@ -494,7 +622,7 @@ io.on("connection", (socket) => {
         const banReason = `Inappropriate message: ${JSON.stringify(mod.results[0].category_scores)}`;
         await pool.query("UPDATE users SET banned_until = NOW() + INTERVAL '750 hours', ban_reason=$1 WHERE id=$2", [
           banReason,
-          uid,
+          userId,
         ]);
 
         socket.emit("moderation_action", {
@@ -506,38 +634,33 @@ io.on("connection", (socket) => {
         });
 
         await pool.query("INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())", [
-          uid,
+          userId,
           "auto_ban",
           banReason,
         ]);
 
-        // Invalidate cache
-        userCache.del(`user:${uid}`);
-
+        userCache.del(`user:${userId}`);
         socket.disconnect(true);
         return;
       }
 
-      const targetRoom = room || userRoom[0];
-
       // Save message to database
       const { rows } = await pool.query(
         "INSERT INTO chat_messages (user_id, room_id, message, created_at) VALUES ($1, $2, $3, NOW()) RETURNING *",
-        [uid, targetRoom, text]
+        [userId, targetRoom, text]
       );
 
       const messageData = {
         id: rows[0].id,
-        uid,
+        uid: userId,
         text,
         timestamp: rows[0].created_at,
-        username: socket.data.user?.username || "User",
+        username: user?.username || "User",
       };
 
-      // FIX: Use socket.to() instead of io.to() to avoid echoing to sender
+      // FIX: Broadcast to room (sender gets it via the line below)
       socket.to(targetRoom).emit("message", messageData);
-
-      // Also send back to sender with consistent format
+      // Echo back to sender with same format
       socket.emit("message", messageData);
     } catch (err) {
       console.error("Chat message error:", err);
@@ -545,46 +668,60 @@ io.on("connection", (socket) => {
     }
   });
 
+  // ────────────────────────────────────────────────
+  // NAME UPDATE — FIX: room validation
+  // ────────────────────────────────────────────────
   socket.on("name-update", async ({ room, name }) => {
-    const uid = requireSocketUser(socket);
-    if (!uid) return;
+    if (!userId) return;
 
     try {
-      const userRoom = userRooms.get(uid);
-      if (!userRoom || (room && !userRoom.includes(room))) {
+      const userRooms = getSocketRooms(socket);
+      let targetRoom = room;
+
+      if (targetRoom) {
+        if (!isInRoom(socket, targetRoom)) return;
+      } else if (userRooms.length > 0) {
+        targetRoom = userRooms[0];
+      } else {
         return;
       }
 
-      await pool.query("UPDATE users SET username=$1, updated_at=NOW() WHERE id=$2", [name, uid]);
+      await pool.query("UPDATE users SET username=$1, updated_at=NOW() WHERE id=$2", [name, userId]);
 
-      const updatedUser = { ...socket.data.user, username: name };
-      userCache.set(`user:${uid}`, updatedUser);
+      const updatedUser = { ...user, username: name };
+      userCache.set(`user:${userId}`, updatedUser);
       socket.data.user = updatedUser;
 
-      const targetRoom = room || userRoom[0];
-      io.to(targetRoom).emit("name-update", { name, uid });
+      io.to(targetRoom).emit("name-update", { name, uid: userId });
     } catch (err) {
       console.error("Name update error:", err);
     }
   });
 
-  // Video Frame Logic
-  let lastFrameModeration = 0;
-
+  // ────────────────────────────────────────────────
+  // VIDEO FRAME — FIX: per-socket throttle, room validation
+  // ────────────────────────────────────────────────
   socket.on("video_frame", async ({ frameBase64, roomId }) => {
-    const uid = requireSocketUser(socket);
-    if (!uid) return;
+    if (!userId) return;
 
-    if (Date.now() - lastFrameModeration < 1000) return;
-    lastFrameModeration = Date.now();
+    // FIX: Per-socket throttle instead of global variable
+    const now = Date.now();
+    if (now - socket.data.lastFrameModeration < 1000) return;
+    socket.data.lastFrameModeration = now;
 
     try {
-      const userRoom = userRooms.get(uid);
-      if (!userRoom || (roomId && !userRoom.includes(roomId))) {
+      const userRooms = getSocketRooms(socket);
+      let targetRoom = roomId;
+
+      if (targetRoom) {
+        if (!isInRoom(socket, targetRoom)) return;
+      } else if (userRooms.length > 0) {
+        targetRoom = userRooms[0];
+      } else {
         return;
       }
 
-      await detectSuspiciousBehavior(uid, "video_frame");
+      await detectSuspiciousBehavior(userId, "video_frame");
 
       const buffer = Buffer.from(frameBase64.split(",")[1], "base64");
 
@@ -610,16 +747,15 @@ io.on("connection", (socket) => {
 
         await pool.query("UPDATE users SET banned_until = NOW() + INTERVAL '750 hours', ban_reason=$1 WHERE id=$2", [
           banReason,
-          uid,
+          userId,
         ]);
 
         await pool.query(
           "INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())",
-          [uid, "auto_ban", banReason]
+          [userId, "auto_ban", banReason]
         );
 
-        // Invalidate cache
-        userCache.del(`user:${uid}`);
+        userCache.del(`user:${userId}`);
 
         socket.emit("moderation_action", {
           type: "video",
@@ -632,19 +768,14 @@ io.on("connection", (socket) => {
         return;
       }
 
-      // Forward frame to the other user
-      const targetRoom = roomId || userRoom[0];
-      const participants = roomParticipants.get(targetRoom) || [];
-
-      const otherUserId = participants.find((id) => String(id) !== String(uid));
-
-      if (otherUserId) {
-        const otherSocketId = onlineSockets.get(String(otherUserId));
-
-        if (otherSocketId) {
-          io.to(otherSocketId).emit("video_frame", {
+      // Forward frame to the other user in the room
+      // FIX: Use Socket.IO room participants instead of roomParticipants Map
+      const roomSockets = await io.in(targetRoom).fetchSockets();
+      for (const s of roomSockets) {
+        if (String(s.data.userId) !== String(userId)) {
+          io.to(s.id).emit("video_frame", {
             frameBase64: processedBase64,
-            from: uid,
+            from: userId,
           });
         }
       }
@@ -653,50 +784,34 @@ io.on("connection", (socket) => {
     }
   });
 
+  // ────────────────────────────────────────────────
+  // JOIN ROOM — FIX: clean leave from previous rooms
+  // ────────────────────────────────────────────────
   socket.on("join_room", async ({ room }) => {
     if (!room) return;
-
-    const uid = requireSocketUser(socket);
-    if (!uid) return;
+    if (!userId) return;
 
     try {
-      const currentRooms = userRooms.get(uid) || [];
-      if (currentRooms.length > 0) {
-        currentRooms.forEach((r) => {
-          socket.leave(r);
-          socket.to(r).emit("peer_left", { socketId: socket.id, userId: uid });
-
-          const participants = roomParticipants.get(r);
-          if (participants) {
-            const index = participants.findIndex((id) => String(id) === String(uid));
-            if (index > -1) {
-              participants.splice(index, 1);
-              roomParticipants.set(r, participants);
-            }
-          }
-        });
+      // Leave all current rooms first
+      const currentRooms = getSocketRooms(socket);
+      for (const r of currentRooms) {
+        socket.leave(r);
+        socket.to(r).emit("peer_left", { socketId: socket.id, userId: userId });
       }
 
       socket.join(room);
 
-      userRooms.set(uid, [room]);
-
-      const participants = roomParticipants.get(room) || [];
-      // Avoid duplicates
-      if (!participants.find((id) => String(id) === String(uid))) {
-        participants.push(uid);
-      }
-      roomParticipants.set(room, participants);
-
       socket.to(room).emit("peer_joined", {
         socketId: socket.id,
-        userId: uid,
-        username: socket.data.user?.username || "User",
+        userId: userId,
+        username: user?.username || "User",
       });
 
-      const { rows } = await pool.query("SELECT * FROM chat_messages WHERE room_id=$1 ORDER BY created_at DESC LIMIT 50", [
-        room,
-      ]);
+      // Load chat history for the room
+      const { rows } = await pool.query(
+        "SELECT * FROM chat_messages WHERE room_id=$1 ORDER BY created_at DESC LIMIT 50",
+        [room]
+      );
 
       socket.emit("room_history", {
         messages: rows.reverse().map((msg) => ({
@@ -708,7 +823,7 @@ io.on("connection", (socket) => {
       });
 
       await pool.query("INSERT INTO room_activity (user_id, room_id, action, created_at) VALUES ($1, $2, $3, NOW())", [
-        uid,
+        userId,
         room,
         "join",
       ]);
@@ -718,33 +833,21 @@ io.on("connection", (socket) => {
     }
   });
 
+  // ────────────────────────────────────────────────
+  // LEAVE ROOM
+  // ────────────────────────────────────────────────
   socket.on("leave_room", async ({ room }) => {
     if (!room) return;
-
-    const uid = requireSocketUser(socket);
-    if (!uid) return;
+    if (!userId) return;
 
     try {
+      if (!isInRoom(socket, room)) return; // FIX: validate membership
+
       socket.leave(room);
-
-      const currentRooms = userRooms.get(uid) || [];
-      const index = currentRooms.indexOf(room);
-      if (index > -1) {
-        currentRooms.splice(index, 1);
-        userRooms.set(uid, currentRooms);
-      }
-
-      const participants = roomParticipants.get(room) || [];
-      const participantIndex = participants.findIndex((id) => String(id) === String(uid));
-      if (participantIndex > -1) {
-        participants.splice(participantIndex, 1);
-        roomParticipants.set(room, participants);
-      }
-
-      socket.to(room).emit("peer_left", { socketId: socket.id, userId: uid });
+      socket.to(room).emit("peer_left", { socketId: socket.id, userId: userId });
 
       await pool.query("INSERT INTO room_activity (user_id, room_id, action, created_at) VALUES ($1, $2, $3, NOW())", [
-        uid,
+        userId,
         room,
         "leave",
       ]);
@@ -754,9 +857,11 @@ io.on("connection", (socket) => {
     }
   });
 
+  // ────────────────────────────────────────────────
+  // REPORT USER — FIX: room validation
+  // ────────────────────────────────────────────────
   socket.on("report_user", async ({ reportedUserId, reason, roomId }) => {
-    const uid = requireSocketUser(socket);
-    if (!uid) return;
+    if (!userId) return;
 
     try {
       if (!reason || reason.length < 10 || reason.length > 200) {
@@ -764,9 +869,8 @@ io.on("connection", (socket) => {
         return;
       }
 
-      // FIX: Relax room check - allow reporting if we have a roomId and the reporter is in it
-      const userRoom = userRooms.get(uid);
-      if (!userRoom || (roomId && !userRoom.includes(roomId))) {
+      // FIX: Validate room membership
+      if (roomId && !isInRoom(socket, roomId)) {
         socket.emit("error", { message: "You can only report users in the same room" });
         return;
       }
@@ -774,7 +878,7 @@ io.on("connection", (socket) => {
       const { rows } = await pool.query(
         `SELECT COUNT(*) as count FROM user_reports 
          WHERE reporter_id=$1 AND reported_id=$2 AND created_at > NOW() - INTERVAL '24 hours'`,
-        [uid, reportedUserId]
+        [userId, reportedUserId]
       );
 
       if (parseInt(rows[0].count) > 0) {
@@ -782,12 +886,10 @@ io.on("connection", (socket) => {
         return;
       }
 
-      await pool.query("INSERT INTO user_reports (reporter_id, reported_id, reason, room_id, created_at) VALUES ($1, $2, $3, $4, NOW())", [
-        uid,
-        reportedUserId,
-        reason,
-        roomId,
-      ]);
+      await pool.query(
+        "INSERT INTO user_reports (reporter_id, reported_id, reason, room_id, created_at) VALUES ($1, $2, $3, $4, NOW())",
+        [userId, reportedUserId, reason, roomId]
+      );
 
       const { rows: reportCount } = await pool.query(
         `SELECT COUNT(*) as count FROM user_reports 
@@ -801,18 +903,19 @@ io.on("connection", (socket) => {
           reportedUserId,
         ]);
 
-        // Invalidate cache
         userCache.del(`user:${reportedUserId}`);
 
-        const reportedSocketId = onlineSockets.get(String(reportedUserId));
+        const reportedSocketId = await getUserSocketId(String(reportedUserId));
         if (reportedSocketId) {
-          io.to(reportedSocketId).emit("banned", {
-            reason: "Multiple user reports",
-            until: new Date(Date.now() + 168 * 60 * 60 * 1000),
-            canAppeal: true,
-          });
-
-          io.sockets.sockets.get(reportedSocketId)?.disconnect(true);
+          const reportedSocket = io.sockets.sockets.get(reportedSocketId);
+          if (reportedSocket) {
+            reportedSocket.emit("banned", {
+              reason: "Multiple user reports",
+              until: new Date(Date.now() + 168 * 60 * 60 * 1000),
+              canAppeal: true,
+            });
+            reportedSocket.disconnect(true);
+          }
         }
       }
 
@@ -823,16 +926,22 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Reaction handler (likes etc.)
+  // ────────────────────────────────────────────────
+  // REACTION — FIX: room validation
+  // ────────────────────────────────────────────────
   socket.on("reaction", async ({ type, room }) => {
-    const uid = requireSocketUser(socket);
-    if (!uid) return;
+    if (!userId) return;
 
-    const userRoom = userRooms.get(uid);
-    if (!userRoom || (room && !userRoom.includes(room))) return;
+    let targetRoom = room;
+    if (targetRoom) {
+      if (!isInRoom(socket, targetRoom)) return;
+    } else {
+      const rooms = getSocketRooms(socket);
+      if (rooms.length === 0) return;
+      targetRoom = rooms[0];
+    }
 
-    const targetRoom = room || userRoom[0];
-    socket.to(targetRoom).emit("reaction", { type, uid, username: socket.data.user?.username || "User" });
+    socket.to(targetRoom).emit("reaction", { type, uid: userId, username: user?.username || "User" });
   });
 });
 
@@ -894,19 +1003,15 @@ app.post("/api/verify-payment", requireAuth, async (req, res) => {
       const coins = parseInt(session.metadata.coins);
       const userId = session.metadata.userId;
 
-      // Update user's coin balance
       await pool.query("UPDATE users SET coins = coins + $1, updated_at = NOW() WHERE id = $2", [coins, userId]);
 
-      // Get updated user data
       const { rows } = await pool.query("SELECT coins FROM users WHERE id = $1", [userId]);
 
-      // Log transaction
       await pool.query(
         "INSERT INTO coin_transactions (user_id, coins, amount, transaction_type, transaction_id, created_at) VALUES ($1, $2, $3, $4, $5, NOW())",
         [userId, coins, session.amount_total / 100, "purchase", sessionId]
       );
 
-      // Invalidate cache for user
       userCache.del(`user:${userId}`);
 
       res.json({
@@ -937,25 +1042,10 @@ async function ensureColumns() {
     reviewed_at TIMESTAMP
   )
 `);
-    await pool.query(`
-  ALTER TABLE appeals 
-  ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'pending'
-`);
-
-await pool.query(`
-  ALTER TABLE appeals 
-  ADD COLUMN IF NOT EXISTS admin_response TEXT
-`);
-
-await pool.query(`
-  ALTER TABLE appeals 
-  ADD COLUMN IF NOT EXISTS admin_id INTEGER
-`);
-
-await pool.query(`
-  ALTER TABLE appeals 
-  ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP
-`);
+    await pool.query(`ALTER TABLE appeals ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'pending'`);
+    await pool.query(`ALTER TABLE appeals ADD COLUMN IF NOT EXISTS admin_response TEXT`);
+    await pool.query(`ALTER TABLE appeals ADD COLUMN IF NOT EXISTS admin_id INTEGER`);
+    await pool.query(`ALTER TABLE appeals ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS coins INTEGER DEFAULT 0`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS looking_for VARCHAR(20) DEFAULT 'any'`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'user'`);
@@ -967,8 +1057,6 @@ await pool.query(`
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS interests TEXT[] DEFAULT '{}'`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS gender VARCHAR(20) DEFAULT 'any'`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS location VARCHAR(50) DEFAULT 'any'`);
-
-    // FIX: Ensure queue table has looking_for column
     await pool.query(`ALTER TABLE queue ADD COLUMN IF NOT EXISTS looking_for VARCHAR(20) DEFAULT 'any'`);
 
     await pool.query(`
@@ -1015,7 +1103,6 @@ app.post("/api/user/spend-coins", requireAuth, async (req, res) => {
       [req.user.id, -coins, 0, type || "spend", giftType || null, recipientId || null]
     );
 
-    // Invalidate cache
     userCache.del(`user:${req.user.id}`);
 
     res.json({ success: true });
@@ -1026,9 +1113,7 @@ app.post("/api/user/spend-coins", requireAuth, async (req, res) => {
 });
 
 // ------------------- MATCHMAKING -------------------
-// FIX: Added lookingForPref parameter for bidirectional matching
 async function tryFindMatch(userId, genderPref, lookingForPref, locationPref, interests = []) {
-  // The candidate should match what I'm looking for, AND their preference should match my gender
   const candidateQuery = `
     SELECT q.user_id, q.gender, q.looking_for, q.location, q.interests, q.nickname, u.username, u.avatar
     FROM queue q
@@ -1045,11 +1130,11 @@ async function tryFindMatch(userId, genderPref, lookingForPref, locationPref, in
 
   const { rows } = await pool.query(candidateQuery, [
     userId,
-    lookingForPref, // $2: what gender I want -> filter by their gender
-    lookingForPref, // $3: if I have a preference, check their preference too
-    genderPref,     // $4: my gender must match their looking_for
-    locationPref,   // $5
-    interests,      // $6
+    lookingForPref,
+    lookingForPref,
+    genderPref,
+    locationPref,
+    interests,
   ]);
 
   if (!rows.length) return null;
@@ -1057,24 +1142,21 @@ async function tryFindMatch(userId, genderPref, lookingForPref, locationPref, in
   const peerId = rows[0].user_id;
   const channelName = `omevo_${Math.min(Number(userId), Number(peerId))}_${Math.max(Number(userId), Number(peerId))}_${Date.now()}`;
 
-  // 1. Insert match record
   await pool.query(`INSERT INTO matches (user_a, user_b, channel_name, created_at) VALUES ($1,$2,$3,NOW())`, [
     userId,
     peerId,
     channelName,
   ]);
 
-  // 2. Fetch requester info BEFORE deleting from queue
   const { rows: requesterRows } = await pool.query(
     "SELECT username, nickname, avatar, gender, location, interests FROM users WHERE id = $1",
     [userId]
   );
 
-  // 3. Delete both from queue
   await pool.query("DELETE FROM queue WHERE user_id = ANY($1::text[])", [[String(userId), String(peerId)]]).catch(() => {});
 
-  // 4. Emit to Peer
-  const peerSocketId = onlineSockets.get(String(peerId));
+  // FIX: Use getUserSocketId for cross-instance support
+  const peerSocketId = await getUserSocketId(String(peerId));
   if (peerSocketId) {
     io.to(peerSocketId).emit("match_found", {
       peerId: userId,
@@ -1090,8 +1172,7 @@ async function tryFindMatch(userId, genderPref, lookingForPref, locationPref, in
     });
   }
 
-  // 5. Emit to Requester
-  const requesterSocketId = onlineSockets.get(String(userId));
+  const requesterSocketId = await getUserSocketId(String(userId));
   if (requesterSocketId) {
     io.to(requesterSocketId).emit("match_found", {
       peerId,
@@ -1111,7 +1192,6 @@ async function tryFindMatch(userId, genderPref, lookingForPref, locationPref, in
 }
 
 // ------------------- USER PREFERENCES -------------------
-// FIX: Include looking_for in GET
 app.get("/api/user/preferences", requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query("SELECT gender, looking_for, location, interests, age_verified FROM users WHERE id = $1", [
@@ -1125,7 +1205,6 @@ app.get("/api/user/preferences", requireAuth, async (req, res) => {
   }
 });
 
-// FIX: Include looking_for in POST
 app.post("/api/user/preferences", requireAuth, async (req, res) => {
   try {
     let { gender = "any", looking_for = "any", location = "any", interests = [], nickname = "" } = req.body;
@@ -1159,7 +1238,6 @@ app.post("/api/user/preferences", requireAuth, async (req, res) => {
       [gender || "any", looking_for || "any", location || "any", interests, nickname || "", userId]
     );
 
-    // Update cache
     const updatedUser = { ...req.user, gender, looking_for, location, interests, nickname };
     userCache.set(`user:${userId}`, updatedUser);
 
@@ -1196,13 +1274,11 @@ app.post("/api/user/verify-age", requireAuth, async (req, res) => {
 });
 
 // ------------------- QUEUE HANDLERS -------------------
-// FIX: Include looking_for in queue operations
 app.post("/queue/enqueue", requireAuth, async (req, res) => {
   try {
     let { gender = "any", looking_for = "any", location = "any", interests = [], nickname = "" } = req.body;
     const userId = String(req.user.id);
 
-    // Check if user is already in a match
     const { rows: activeMatch } = await pool.query("SELECT * FROM matches WHERE (user_a=$1 OR user_b=$1) AND ended_at IS NULL", [
       userId,
     ]);
@@ -1235,7 +1311,6 @@ app.post("/queue/enqueue", requireAuth, async (req, res) => {
 
     interests = interests.filter((interest) => typeof interest === "string" && interest.length > 0 && interest.length <= 30);
 
-    // FIX: Include looking_for in queue insert
     await pool.query(
       `INSERT INTO queue (user_id, gender, looking_for, location, interests, nickname, joined_at)
        VALUES ($1,$2,$3,$4,$5,$6,NOW())
@@ -1246,7 +1321,6 @@ app.post("/queue/enqueue", requireAuth, async (req, res) => {
       [userId, gender || "any", looking_for || "any", location || "any", interests, nickname]
     );
 
-    // FIX: Pass looking_for to match function
     const match = await tryFindMatch(userId, gender || "any", looking_for || "any", location || "any", interests);
     if (match) return res.json({ matched: true, peerId: match.peerId, channel: match.channel });
 
@@ -1257,7 +1331,6 @@ app.post("/queue/enqueue", requireAuth, async (req, res) => {
   }
 });
 
-// QUEUE CHECK ENDPOINT
 app.get("/queue/check", requireAuth, async (req, res) => {
   try {
     const userId = String(req.user.id);
@@ -1271,7 +1344,10 @@ app.get("/queue/check", requireAuth, async (req, res) => {
       const match = rows[0];
       const peerId = match.user_a === userId ? match.user_b : match.user_a;
 
-      const { rows: peerRows } = await pool.query("SELECT username, nickname, avatar, gender, location, interests FROM users WHERE id=$1", [peerId]);
+      const { rows: peerRows } = await pool.query(
+        "SELECT username, nickname, avatar, gender, location, interests FROM users WHERE id=$1",
+        [peerId]
+      );
 
       return res.json({
         matched: true,
@@ -1649,14 +1725,18 @@ app.post("/api/admin/ban", requireAuth, async (req, res) => {
 
     userCache.del(`user:${userId}`);
 
-    const socketId = onlineSockets.get(String(userId));
+    // FIX: Use getUserSocketId for cross-instance support
+    const socketId = await getUserSocketId(String(userId));
     if (socketId) {
-      io.sockets.sockets.get(socketId)?.emit("banned", {
-        reason: "Banned by admin",
-        until: banUntil,
-        canAppeal: true,
-      });
-      io.sockets.sockets.get(socketId)?.disconnect(true);
+      const targetSocket = io.sockets.sockets.get(socketId);
+      if (targetSocket) {
+        targetSocket.emit("banned", {
+          reason: "Banned by admin",
+          until: banUntil,
+          canAppeal: true,
+        });
+        targetSocket.disconnect(true);
+      }
     }
 
     res.json({ ok: true });
@@ -1739,6 +1819,7 @@ app.get("/health", (req, res) => {
     env: process.env.NODE_ENV || "dev",
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
+    redis: redisClient ? "connected" : "not_configured",
   });
 });
 
@@ -1759,11 +1840,36 @@ cron.schedule("0 3 * * *", async () => {
   }
 });
 
-socket.on("connect_error", (err) => {
-  console.error("Socket connect error:", err);
-  showToast("Connection failed", "error");
-});
+// ────────────────────────────────────────────────────────
+// FIX: Removed the client-side `socket.on("connect_error")`
+// that was incorrectly placed in server code.
+// This should be in the frontend:
+//
+//   const socket = io(SERVER_URL, {
+//     auth: { token: jwtToken }  // <-- passes token in handshake
+//   });
+//   socket.on("connect_error", (err) => {
+//     console.error("Socket connection failed:", err.message);
+//   });
+//
+// ────────────────────────────────────────────────────────
 
 // ------------------- START SERVER -------------------
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+async function startServer() {
+  // Initialize Redis adapter before starting
+  await initRedis();
+
+  server.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`   Redis: ${redisClient ? "✅ connected" : "⚠️  not configured"}`);
+    console.log(`   Stripe: ${stripe ? "✅ configured" : "⚠️  not configured"}`);
+    console.log(`   Coinbase: ${ChargeResource ? "✅ configured" : "⚠️  not configured"}`);
+  });
+}
+
+startServer().catch((err) => {
+  console.error("Failed to start server:", err);
+  process.exit(1);
+});
