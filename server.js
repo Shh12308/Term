@@ -438,7 +438,7 @@ app.get(
 
 app.get("/auth/discord", authLimiter, passport.authenticate("discord"));
 app.get(
-  "/auth/discord/auth/callback",
+  "/auth/discord/video",
   authLimiter,
   passport.authenticate("discord", { failureRedirect: "/auth/failure", session: true }),
   (req, res) => {
