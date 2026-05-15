@@ -437,13 +437,8 @@ app.get(
 );
 
 app.get("/auth/discord", authLimiter, passport.authenticate("discord"));
-app.get(
-  "/auth/callback/discord",
-  authLimiter,
-  passport.authenticate("discord", { failureRedirect: "/auth/failure", session: true }),
-  (req, res) => {
-    const token = signJwtForUser(req.user);
-    res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}`); });
+app.get("/api/auth/discord/callback", passport.authenticate("discord", { failureRedirect: "/callback", session: false }), (req, res) => { const token = jwt.sign({ id: req.user.id }, JWT_SECRET, { expiresIn: "7d" }); res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}`); });
+app.get("/api/auth/github", passport.authenticate("github", { session: false }));
   }
 );
 
