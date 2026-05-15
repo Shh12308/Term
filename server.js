@@ -443,7 +443,7 @@ app.get(
   passport.authenticate("discord", { failureRedirect: "/auth/failure", session: true }),
   (req, res) => {
     const token = signJwtForUser(req.user);
-    res.redirect(`${process.env.FRONTEND_URL || "/video"}?token=${token}`);
+    res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}`); });
   }
 );
 
