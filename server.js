@@ -427,7 +427,7 @@ async function requireAuth(req, res, next) {
 // ------------------- OAUTH ROUTES -------------------
 app.get("/auth/google", authLimiter, passport.authenticate("google", { scope: ["profile", "email"] }));
 app.get(
-  "/auth/google/callback",
+  "/auth/callback/google",
   authLimiter,
   passport.authenticate("google", { failureRedirect: "/auth/failure", session: true }),
   (req, res) => {
@@ -438,7 +438,7 @@ app.get(
 
 app.get("/auth/discord", authLimiter, passport.authenticate("discord"));
 app.get(
-  "/auth/discord/video",
+  "/auth/callback/discord",
   authLimiter,
   passport.authenticate("discord", { failureRedirect: "/auth/failure", session: true }),
   (req, res) => {
@@ -449,7 +449,7 @@ app.get(
 
 app.get("/auth/facebook", authLimiter, passport.authenticate("facebook", { scope: ["email"] }));
 app.get(
-  "/auth/facebook/callback",
+  "/auth/callback/facebook",
   authLimiter,
   passport.authenticate("facebook", { failureRedirect: "/auth/failure", session: true }),
   (req, res) => {
