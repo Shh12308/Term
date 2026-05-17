@@ -354,7 +354,7 @@ app.get("/", (req, res) => {
 // ------------------- OAUTH ROUTES -------------------
 app.get("/auth/google", authLimiter, passport.authenticate("google", { scope: ["profile", "email"] }));
 app.get(
-  "/auth/callback/google",
+  "/auth/google/callback",
   authLimiter,
   passport.authenticate("google", { failureRedirect: "/auth/failure", session: true }),
   (req, res) => {
