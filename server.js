@@ -359,7 +359,7 @@ app.get(
   passport.authenticate("google", { failureRedirect: "/auth/failure", session: true }),
   (req, res) => {
     const token = signJwtForUser(req.user);
-    res.redirect(`${process.env.FRONTEND_URL}/auth/callback"}?token=${token}`);
+    res.redirect(`${process.env.FRONTEND_URL}/auth/callback?token=${token}`);
   }
 );
 
