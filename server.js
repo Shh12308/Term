@@ -82,9 +82,9 @@ const pool = new pg.Pool({
   ssl: {
     rejectUnauthorized: false,
   },
-  max: 10, // lower connection count (safer for production/free tiers)
-  idleTimeoutMillis: 30000, // keep
-  connectionTimeoutMillis: 5000, // increase timeout
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || "super_secret_jwt_key";
@@ -103,6 +103,17 @@ const MAX_INTERESTS = 5;
 const MAX_NICKNAME_LENGTH = 20;
 const MIN_AGE_FOR_VIDEO = 18;
 
+// Matchmaking config
+const MATCH_WEIGHTS = {
+  location: 40,      // 40% weight for same location
+  interests: 30,     // 30% weight for shared interests
+  freshness: 20,     // 20% weight for queue time (prefer waiting users)
+  gender: 10,        // 10% weight for gender preference match
+};
+const ANTI_REPEAT_WINDOW_HOURS = 2;  // Don't match same user within 2 hours
+const MAX_CANDIDATES_TO_SCAN = 100;  // Max candidates to evaluate per match
+const MATCH_LOCK_TTL = 5;           // Seconds to hold match lock
+
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
 let ChargeResource = null;
@@ -120,6 +131,7 @@ const userCache = new NodeCache({ stdTTL: 300, checkperiod: 120 });
 
 // ------------------- REDIS & ADAPTER -------------------
 let redisClient = null;
+let useRedisForMatching = false;
 
 async function initRedis() {
   if (!process.env.REDIS_URL) {
@@ -135,7 +147,8 @@ async function initRedis() {
     await subClient.connect();
     redisClient = pubClient;
     io.adapter(createAdapter(pubClient, subClient));
-    console.log("✅ Socket.IO Redis adapter connected");
+    useRedisForMatching = true;
+    console.log("✅ Socket.IO Redis adapter connected (matchmaking enabled)");
   } catch (err) {
     console.warn("⚠️  Redis adapter failed to initialize (falling back to local):", err.message);
   }
@@ -179,6 +192,325 @@ function getSocketRooms(socket) {
 
 function isInRoom(socket, room) {
   return socket.rooms.has(room);
+}
+
+// ==========================================
+// 🚀 MATCHMAKING ENGINE (UPGRADED)
+// ==========================================
+
+// In-memory fallback queue (used when Redis unavailable)
+const localMatchQueue = new Map(); // userId -> queueEntry
+
+// Queue entry structure:
+// {
+//   userId, socketId, gender, looking_for, location, interests,
+//   nickname, username, avatar, ts (join timestamp)
+// }
+
+// ------------------- REDIS QUEUE OPERATIONS -------------------
+async function redisQueueAdd(entry) {
+  if (!redisClient) return false;
+  try {
+    const key = `matchq:${entry.userId}`;
+    await redisClient.hSet(key, {
+      userId: String(entry.userId),
+      socketId: entry.socketId,
+      gender: entry.gender || "any",
+      looking_for: entry.looking_for || "any",
+      location: entry.location || "any",
+      interests: JSON.stringify(entry.interests || []),
+      nickname: entry.nickname || "",
+      username: entry.username || "",
+      avatar: entry.avatar || "",
+      ts: String(entry.ts),
+    });
+    await redisClient.zAdd("match_queue", { score: entry.ts, value: String(entry.userId) });
+    await redisClient.expire(key, 3600); // Auto-cleanup after 1 hour
+    return true;
+  } catch (err) {
+    console.error("Redis queue add error:", err.message);
+    return false;
+  }
+}
+
+async function redisQueueRemove(userId) {
+  if (!redisClient) return false;
+  try {
+    await redisClient.zRem("match_queue", String(userId));
+    await redisClient.del(`matchq:${userId}`);
+    return true;
+  } catch (err) {
+    console.error("Redis queue remove error:", err.message);
+    return false;
+  }
+}
+
+async function redisQueueGetAll() {
+  if (!redisClient) return [];
+  try {
+    const userIds = await redisClient.zRange("match_queue", 0, -1);
+    const entries = [];
+    for (const uid of userIds) {
+      const data = await redisClient.hGetAll(`matchq:${uid}`);
+      if (data && data.userId) {
+        entries.push({
+          ...data,
+          interests: JSON.parse(data.interests || "[]"),
+          ts: parseInt(data.ts),
+        });
+      }
+    }
+    return entries;
+  } catch (err) {
+    console.error("Redis queue get error:", err.message);
+    return [];
+  }
+}
+
+async function redisQueueGetCount() {
+  if (!redisClient) return 0;
+  try {
+    return await redisClient.zCard("match_queue");
+  } catch {
+    return 0;
+  }
+}
+
+// ------------------- REDIS LOCK -------------------
+async function acquireMatchLock(userId) {
+  if (!redisClient) return true; // No Redis = no lock needed
+  try {
+    const result = await redisClient.set(
+      `lock:match:${userId}`,
+      "1",
+      { NX: true, EX: MATCH_LOCK_TTL }
+    );
+    return result === "OK";
+  } catch (err) {
+    console.error("Redis lock error:", err.message);
+    return false;
+  }
+}
+
+async function releaseMatchLock(userId) {
+  if (!redisClient) return;
+  try {
+    await redisClient.del(`lock:match:${userId}`);
+  } catch {}
+}
+
+// ------------------- ANTI-REPEAT CHECK -------------------
+async function getRecentMatchPartners(userId, limit = 20) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT CASE WHEN user_a = $1 THEN user_b ELSE user_a END as partner_id
+       FROM matches
+       WHERE (user_a = $1 OR user_b = $1)
+       AND created_at > NOW() - INTERVAL '${ANTI_REPEAT_WINDOW_HOURS} hours'
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [userId, limit]
+    );
+    return new Set(rows.map(r => String(r.partner_id)));
+  } catch (err) {
+    console.error("Recent matches fetch error:", err.message);
+    return new Set();
+  }
+}
+
+// ------------------- MATCH SCORING -------------------
+function calculateMatchScore(a, b, aWaitTime, bWaitTime) {
+  let score = 0;
+
+  // Location matching (40 points max)
+  if (a.location === b.location && a.location !== "any") {
+    score += MATCH_WEIGHTS.location;
+  } else if (a.location === "any" || b.location === "any") {
+    score += MATCH_WEIGHTS.location * 0.5; // Partial credit for flexible location
+  }
+
+  // Interest overlap (30 points max)
+  const aInterests = new Set(a.interests || []);
+  const bInterests = new Set(b.interests || []);
+  let overlapCount = 0;
+  for (const interest of aInterests) {
+    if (bInterests.has(interest)) overlapCount++;
+  }
+  const maxInterests = Math.max(aInterests.size, bInterests.size, 1);
+  const interestRatio = overlapCount / maxInterests;
+  score += MATCH_WEIGHTS.interests * interestRatio;
+
+  // Freshness/fairness (20 points max) - reward users who waited longer
+  const maxWait = Math.max(aWaitTime, bWaitTime, 1000);
+  const avgWaitRatio = ((aWaitTime + bWaitTime) / 2) / maxWait;
+  score += MATCH_WEIGHTS.freshness * avgWaitRatio;
+
+  // Gender preference matching (10 points max)
+  const aWantsB = a.looking_for === "any" || a.looking_for === b.gender;
+  const bWantsA = b.looking_for === "any" || b.looking_for === a.gender;
+  if (aWantsB && bWantsA) {
+    score += MATCH_WEIGHTS.gender;
+  } else if (aWantsB || bWantsA) {
+    score += MATCH_WEIGHTS.gender * 0.5;
+  }
+
+  return score;
+}
+
+// ------------------- CORE MATCHING ENGINE -------------------
+async function tryMatchForUser(requesterUserId) {
+  const now = Date.now();
+  
+  // Acquire lock to prevent double-matching
+  const lockAcquired = await acquireMatchLock(requesterUserId);
+  if (!lockAcquired) {
+    console.log(`🔒 Lock busy for user ${requesterUserId}, skipping match attempt`);
+    return null;
+  }
+
+  try {
+    // Get all queue entries
+    let allEntries;
+    if (useRedisForMatching) {
+      allEntries = await redisQueueGetAll();
+    } else {
+      allEntries = Array.from(localMatchQueue.values());
+    }
+
+    // Find the requester
+    const requester = allEntries.find(e => String(e.userId) === String(requesterUserId));
+    if (!requester) {
+      return null;
+    }
+
+    // Get recent partners to avoid repeat matching
+    const recentPartners = await getRecentMatchPartners(requesterUserId);
+    
+    // Filter and score candidates
+    let bestCandidate = null;
+    let bestScore = -1;
+    let candidatesEvaluated = 0;
+
+    for (const candidate of allEntries) {
+      if (String(candidate.userId) === String(requesterUserId)) continue;
+      if (recentPartners.has(String(candidate.userId))) continue;
+      if (candidatesEvaluated >= MAX_CANDIDATES_TO_SCAN) break;
+
+      // Basic compatibility check
+      const requesterWantsCandidate = requester.looking_for === "any" || requester.looking_for === candidate.gender;
+      const candidateWantsRequester = candidate.looking_for === "any" || candidate.looking_for === requester.gender;
+      
+      if (!requesterWantsCandidate || !candidateWantsRequester) continue;
+
+      // Calculate score
+      const aWaitTime = now - (requester.ts || now);
+      const bWaitTime = now - (candidate.ts || now);
+      const score = calculateMatchScore(requester, candidate, aWaitTime, bWaitTime);
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestCandidate = candidate;
+      }
+      candidatesEvaluated++;
+    }
+
+    if (!bestCandidate || bestScore < 20) {
+      // No suitable match found (minimum score threshold)
+      return null;
+    }
+
+    // Verify both users are still online
+    const requesterSocketId = await getUserSocketId(String(requesterUserId));
+    const candidateSocketId = await getUserSocketId(String(bestCandidate.userId));
+    
+    if (!requesterSocketId || !candidateSocketId) {
+      // Clean up stale entries
+      if (!requesterSocketId) await removeFromQueue(requesterUserId);
+      if (!candidateSocketId) await removeFromQueue(bestCandidate.userId);
+      return null;
+    }
+
+    // Acquire lock on candidate too
+    const candidateLockAcquired = await acquireMatchLock(bestCandidate.userId);
+    if (!candidateLockAcquired) {
+      return null; // Candidate is being matched elsewhere
+    }
+
+    try {
+      // Remove both from queue
+      await removeFromQueue(requesterUserId);
+      await removeFromQueue(bestCandidate.userId);
+
+      // Create match in DB
+      const channelName = `omevo_${Math.min(Number(requesterUserId), Number(bestCandidate.userId))}_${Math.max(Number(requesterUserId), Number(bestCandidate.userId))}_${Date.now()}`;
+      
+      await pool.query(
+        `INSERT INTO matches (user_a, user_b, channel_name, created_at) VALUES ($1, $2, $3, NOW())`,
+        [requesterUserId, bestCandidate.userId, channelName]
+      );
+
+      // Build peer info objects
+      const requesterInfo = {
+        username: requester.username || "User",
+        nickname: requester.nickname || "",
+        avatar: requester.avatar || "",
+        gender: requester.gender || "any",
+        location: requester.location || "any",
+        interests: requester.interests || [],
+      };
+
+      const candidateInfo = {
+        username: bestCandidate.username || "User",
+        nickname: bestCandidate.nickname || "",
+        avatar: bestCandidate.avatar || "",
+        gender: bestCandidate.gender || "any",
+        location: bestCandidate.location || "any",
+        interests: bestCandidate.interests || [],
+      };
+
+      // Emit match_found to both users
+      io.to(requesterSocketId).emit("match_found", {
+        peerId: bestCandidate.userId,
+        channel: channelName,
+        peerInfo: candidateInfo,
+        score: Math.round(bestScore),
+      });
+
+      io.to(candidateSocketId).emit("match_found", {
+        peerId: requesterUserId,
+        channel: channelName,
+        peerInfo: requesterInfo,
+        score: Math.round(bestScore),
+      });
+
+      console.log(`✅ Matched ${requesterUserId} ↔ ${bestCandidate.userId} (score: ${Math.round(bestScore)})`);
+
+      return { peerId: bestCandidate.userId, channel: channelName };
+    } finally {
+      await releaseMatchLock(bestCandidate.userId);
+    }
+  } finally {
+    await releaseMatchLock(requesterUserId);
+  }
+}
+
+// Remove user from queue (both Redis and local)
+async function removeFromQueue(userId) {
+  const uid = String(userId);
+  localMatchQueue.delete(uid);
+  if (useRedisForMatching) {
+    await redisQueueRemove(uid);
+  }
+  // Also clean up DB queue for backwards compatibility
+  await pool.query("DELETE FROM queue WHERE user_id=$1", [uid]).catch(() => {});
+}
+
+// Get queue count
+async function getQueueCount() {
+  if (useRedisForMatching) {
+    return await redisQueueGetCount();
+  }
+  return localMatchQueue.size;
 }
 
 // ------------------- SESSION & PASSPORT -------------------
@@ -331,8 +663,7 @@ async function requireAuth(req, res, next) {
   } catch (err) { return res.status(401).json({ error: "Invalid token" }); }
 }
 
-// ================== ROOT ROUTE FIX ==================
-// Fixes the 404 errors on GET /
+// ================== ROOT ROUTE ==================
 app.get("/", (req, res) => {
   res.status(200).send(`
     <h1>🚀 Omevo Backend is Running</h1>
@@ -343,13 +674,13 @@ app.get("/", (req, res) => {
     <ul>
       <li>Database: ✅ Connected</li>
       <li>Redis: ${redisClient ? "✅ Connected" : "⚠️ Not Configured"}</li>
+      <li>Matchmaking: ${useRedisForMatching ? "🚀 Redis-powered" : "⚡ In-memory mode"}</li>
       <li>Stripe: ${stripe ? "✅ Configured" : "⚠️ Not Configured"}</li>
       <li>Coinbase: ${ChargeResource ? "✅ Configured" : "⚠️ Not Configured"}</li>
     </ul>
     <p><a href="/auth/google">Login with Google</a></p>
   `);
 });
-// =====================================================
 
 // ------------------- OAUTH ROUTES -------------------
 app.get("/auth/google", authLimiter, passport.authenticate("google", { scope: ["profile", "email"] }));
@@ -381,7 +712,6 @@ app.get(
   passport.authenticate("facebook", { failureRedirect: "/auth/failure", session: true }),
   (req, res) => {
     const token = signJwtForUser(req.user);
-    // CHANGE THIS: Redirect to /auth/callback so your React component can handle the token
     res.redirect(`${process.env.FRONTEND_URL}/auth/callback?token=${token}`);
   }
 );
@@ -433,6 +763,7 @@ io.use(async (socket, next) => {
     socket.data.userId = user.id;
     socket.data.user = user;
     socket.data.lastFrameModeration = 0;
+    socket.data.inQueue = false;
     next();
   } catch (err) {
     console.error("Socket auth middleware rejected:", err.message);
@@ -459,42 +790,188 @@ io.on("connection", (socket) => {
   setUserOnline(String(userId), socket.id);
   socket.emit("authenticated", { userId: userId });
 
+  // ==========================================
+  // 🚀 REAL-TIME QUEUE EVENTS (NEW)
+  // ==========================================
+
+  socket.on("join_queue", async (data = {}) => {
+    if (!userId) return socket.emit("error", { message: "Not authenticated" });
+    
+    try {
+      // Check if already in a match
+      const { rows: activeMatch } = await pool.query(
+        "SELECT * FROM matches WHERE (user_a=$1 OR user_b=$1) AND ended_at IS NULL",
+        [userId]
+      );
+      if (activeMatch.length > 0) {
+        return socket.emit("error", { message: "You're already in a match" });
+      }
+
+      // Check if banned
+      if (user.banned_until && new Date(user.banned_until) > new Date()) {
+        return socket.emit("error", { message: "Account is banned" });
+      }
+
+      // Check age verification
+      if (!user.age_verified) {
+        return socket.emit("error", { message: "Age verification required for video features" });
+      }
+
+      // Validate nickname
+      const nickname = data.nickname || user.nickname || "";
+      if (nickname && (nickname.length > MAX_NICKNAME_LENGTH || nickname.length < 1)) {
+        return socket.emit("error", { message: `Nickname must be between 1 and ${MAX_NICKNAME_LENGTH} characters` });
+      }
+
+      // Validate interests
+      let interests = data.interests || user.interests || [];
+      if (!Array.isArray(interests) || interests.length > MAX_INTERESTS) {
+        return socket.emit("error", { message: `You can have up to ${MAX_INTERESTS} interests` });
+      }
+      interests = interests.filter(i => typeof i === "string" && i.length > 0 && i.length <= 30);
+
+      // Determine location
+      let location = data.location || user.location || "any";
+      if (!location || location === "any") {
+        const ip = socket.handshake.headers["x-forwarded-for"]?.split(",")[0] || socket.handshake.address;
+        const geo = geoip.lookup(ip);
+        location = geo?.country?.toLowerCase() || "any";
+      }
+
+      // Build queue entry
+      const queueEntry = {
+        userId: String(userId),
+        socketId: socket.id,
+        gender: data.gender || user.gender || "any",
+        looking_for: data.looking_for || user.looking_for || "any",
+        location,
+        interests,
+        nickname,
+        username: user.username || "User",
+        avatar: user.avatar || "",
+        ts: Date.now(),
+      };
+
+      // Add to queue
+      if (useRedisForMatching) {
+        await redisQueueAdd(queueEntry);
+      }
+      localMatchQueue.set(String(userId), queueEntry);
+      socket.data.inQueue = true;
+
+      // Update DB (backwards compatibility)
+      await pool.query(
+        `INSERT INTO queue (user_id, gender, looking_for, location, interests, nickname, joined_at) 
+         VALUES ($1,$2,$3,$4,$5,$6,NOW()) 
+         ON CONFLICT (user_id) DO UPDATE SET gender=EXCLUDED.gender, looking_for=EXCLUDED.looking_for, 
+         location=EXCLUDED.location, interests=EXCLUDED.interests, nickname=EXCLUDED.nickname, joined_at=NOW()`,
+        [queueEntry.userId, queueEntry.gender, queueEntry.looking_for, queueEntry.location, queueEntry.interests, queueEntry.nickname]
+      );
+
+      // Update user preferences in DB
+      await pool.query(
+        `UPDATE users SET gender=$1, looking_for=$2, location=$3, interests=$4, nickname=$5, updated_at=NOW() WHERE id=$6`,
+        [queueEntry.gender, queueEntry.looking_for, queueEntry.location, queueEntry.interests, queueEntry.nickname, userId]
+      );
+
+      // Emit queue status
+      const queueCount = await getQueueCount();
+      socket.emit("queue_joined", { 
+        position: queueCount, 
+        locationUsed: location,
+        estimatedWait: queueCount > 1 ? "Searching..." : "Waiting for others..."
+      });
+
+      console.log(`📋 User ${user.username} joined queue (position: ${queueCount})`);
+
+      // 🚀 IMMEDIATELY TRY TO MATCH
+      const match = await tryMatchForUser(userId);
+      
+      if (match) {
+        // Match found! (match_found already emitted by tryMatchForUser)
+        console.log(`⚡ Instant match for ${user.username}`);
+      } else {
+        // No match yet - client can show waiting UI
+        socket.emit("queue_waiting", { 
+          position: await getQueueCount(),
+          message: "Looking for someone to chat with..." 
+        });
+      }
+
+    } catch (err) {
+      console.error("Join queue error:", err);
+      socket.emit("error", { message: "Failed to join queue" });
+    }
+  });
+
+  socket.on("leave_queue", async () => {
+    if (!userId) return;
+    
+    try {
+      await removeFromQueue(userId);
+      socket.data.inQueue = false;
+      socket.emit("queue_left", { message: "Left the queue" });
+      console.log(`📋 User ${user.username} left queue`);
+    } catch (err) {
+      console.error("Leave queue error:", err);
+    }
+  });
+
+  socket.on("queue_status", async () => {
+    if (!userId) return;
+    
+    try {
+      const queueCount = await getQueueCount();
+      socket.emit("queue_status", { 
+        inQueue: socket.data.inQueue || localMatchQueue.has(String(userId)),
+        position: queueCount 
+      });
+    } catch (err) {
+      console.error("Queue status error:", err);
+    }
+  });
+
+  // ==========================================
+  // EXISTING SOCKET EVENTS
+  // ==========================================
+
   socket.on("typing", ({ room }) => {
     if (!room || !isInRoom(socket, room)) return;
     socket.to(room).emit("typing", { uid: userId });
   });
 
   socket.on("disconnect", async (reason) => {
-  console.log(`❌ User ${user.username} disconnected: ${socket.id} (${reason})`);
+    console.log(`❌ User ${user.username} disconnected: ${socket.id} (${reason})`);
 
-  try {
-    // Mark user offline
-    await setUserOffline(String(userId));
+    try {
+      // Mark user offline
+      await setUserOffline(String(userId));
 
-    // 🔥 END ACTIVE MATCH
-    await pool.query(
-      `UPDATE matches 
-       SET ended_at = NOW() 
-       WHERE (user_a = $1 OR user_b = $1) 
-       AND ended_at IS NULL`,
-      [userId]
-    );
+      // End active match
+      await pool.query(
+        `UPDATE matches SET ended_at = NOW() WHERE (user_a = $1 OR user_b = $1) AND ended_at IS NULL`,
+        [userId]
+      );
 
-    // Notify peers in rooms
-    const rooms = getSocketRooms(socket);
-    for (const room of rooms) {
-      socket.to(room).emit("peer_left", {
-        socketId: socket.id,
-        userId: userId,
-      });
+      // Remove from queue
+      await removeFromQueue(userId);
+      socket.data.inQueue = false;
+
+      // Notify peers in rooms
+      const rooms = getSocketRooms(socket);
+      for (const room of rooms) {
+        socket.to(room).emit("peer_left", {
+          socketId: socket.id,
+          userId: userId,
+        });
+      }
+
+      // Also clean up DB queue
+      await pool.query("DELETE FROM queue WHERE user_id=$1", [String(userId)]).catch(() => {});
+    } catch (err) {
+      console.error("Disconnect cleanup error:", err);
     }
-
-    // Remove from queue
-    await pool.query("DELETE FROM queue WHERE user_id=$1", [String(userId)]);
-  } catch (err) {
-    console.error("Disconnect cleanup error:", err);
-  }
-});
+  });
 
   socket.on("message", async ({ room, text }) => {
     if (!userId) return socket.emit("error", { message: "Not authenticated" });
@@ -663,6 +1140,48 @@ io.on("connection", (socket) => {
     }
     socket.to(targetRoom).emit("reaction", { type, uid: userId, username: user?.username || "User" });
   });
+
+  // ==========================================
+  // 🚀 NEXT/SKIP - Instant re-queue (NEW)
+  // ==========================================
+
+  socket.on("next", async () => {
+    if (!userId) return;
+    
+    try {
+      // End current match
+      await pool.query(
+        `UPDATE matches SET ended_at = NOW() WHERE (user_a = $1 OR user_b = $1) AND ended_at IS NULL`,
+        [userId]
+      );
+
+      // Leave current room
+      const rooms = getSocketRooms(socket);
+      for (const room of rooms) {
+        socket.leave(room);
+        socket.to(room).emit("peer_left", { socketId: socket.id, userId: userId });
+      }
+
+      // Auto re-join queue with same preferences
+      const cachedEntry = localMatchQueue.get(String(userId));
+      const data = cachedEntry ? {
+        gender: cachedEntry.gender,
+        looking_for: cachedEntry.looking_for,
+        location: cachedEntry.location,
+        interests: cachedEntry.interests,
+        nickname: cachedEntry.nickname,
+      } : {};
+
+      socket.emit("next_ready");
+      
+      // Trigger join_queue with previous preferences
+      socket.emit("auto_requeue", { preferences: data });
+      
+    } catch (err) {
+      console.error("Next error:", err);
+      socket.emit("error", { message: "Failed to find next match" });
+    }
+  });
 });
 
 // ------------------- API ROUTES -------------------
@@ -738,30 +1257,6 @@ app.post("/api/user/spend-coins", requireAuth, async (req, res) => {
   } catch (error) { console.error("Error spending coins:", error); res.status(500).json({ error: "Failed to spend coins" }); }
 });
 
-// ------------------- MATCHMAKING -------------------
-async function tryFindMatch(userId, genderPref, lookingForPref, locationPref, interests = []) {
-  const candidateQuery = `SELECT q.user_id, q.gender, q.looking_for, q.location, q.interests, q.nickname, u.username, u.avatar FROM queue q JOIN users u ON q.user_id = u.id WHERE q.user_id <> $1 AND ($2='any' OR q.gender=$2) AND ($3='any' OR q.looking_for=$4) AND ($5='any' OR q.location=$5) AND (u.banned_until IS NULL OR u.banned_until < NOW()) ORDER BY CASE WHEN $6::text[] && q.interests THEN 1 ELSE 2 END, joined_at ASC LIMIT 1`;
-  const { rows } = await pool.query(candidateQuery, [userId, lookingForPref, lookingForPref, genderPref, locationPref, interests]);
-  if (!rows.length) return null;
-
-  const peerId = rows[0].user_id;
-  const channelName = `omevo_${Math.min(Number(userId), Number(peerId))}_${Math.max(Number(userId), Number(peerId))}_${Date.now()}`;
-  await pool.query(`INSERT INTO matches (user_a, user_b, channel_name, created_at) VALUES ($1,$2,$3,NOW())`, [userId, peerId, channelName]);
-
-  const { rows: requesterRows } = await pool.query("SELECT username, nickname, avatar, gender, location, interests FROM users WHERE id = $1", [userId]);
-  await pool.query("DELETE FROM queue WHERE user_id = ANY($1::text[])", [[String(userId), String(peerId)]]).catch(() => {});
-
-  const peerSocketId = await getUserSocketId(String(peerId));
-  if (peerSocketId) {
-    io.to(peerSocketId).emit("match_found", { peerId: userId, channel: channelName, peerInfo: { username: requesterRows[0]?.username, nickname: requesterRows[0]?.nickname, avatar: requesterRows[0]?.avatar, gender: requesterRows[0]?.gender, location: requesterRows[0]?.location, interests: requesterRows[0]?.interests } });
-  }
-  const requesterSocketId = await getUserSocketId(String(userId));
-  if (requesterSocketId) {
-    io.to(requesterSocketId).emit("match_found", { peerId, channel: channelName, peerInfo: { username: rows[0].username, nickname: rows[0].nickname, avatar: rows[0].avatar, gender: rows[0].gender, location: rows[0].location, interests: rows[0].interests } });
-  }
-  return { peerId, channel: channelName };
-}
-
 // ------------------- USER PREFERENCES -------------------
 app.post("/api/user/preferences", requireAuth, async (req, res) => {
   try {
@@ -792,8 +1287,15 @@ app.post("/api/user/verify-age", requireAuth, async (req, res) => {
   } catch (err) { console.error("Age verification failed:", err); res.status(500).json({ error: "Could not verify age" }); }
 });
 
-// ------------------- QUEUE HANDLERS -------------------
+// ==========================================
+// 🚀 LEGACY QUEUE ENDPOINTS (DEPRECATED - Keep for backwards compatibility)
+// ==========================================
+
 app.post("/queue/enqueue", requireAuth, async (req, res) => {
+  // DEPRECATED: Use socket event "join_queue" instead
+  // This endpoint still works but logs a warning
+  console.warn("⚠️  DEPRECATED: /queue/enqueue called - use socket event 'join_queue' instead");
+  
   try {
     let { gender = "any", looking_for = "any", location = "any", interests = [], nickname = "" } = req.body;
     const userId = String(req.user.id);
@@ -805,14 +1307,46 @@ app.post("/queue/enqueue", requireAuth, async (req, res) => {
     if (nickname && (nickname.length > MAX_NICKNAME_LENGTH || nickname.length < 1)) return res.status(400).json({ error: `Nickname must be between 1 and ${MAX_NICKNAME_LENGTH} characters` });
     if (!Array.isArray(interests) || interests.length > MAX_INTERESTS) return res.status(400).json({ error: `You can have up to ${MAX_INTERESTS} interests` });
     interests = interests.filter((interest) => typeof interest === "string" && interest.length > 0 && interest.length <= 30);
-    await pool.query(`INSERT INTO queue (user_id, gender, looking_for, location, interests, nickname, joined_at) VALUES ($1,$2,$3,$4,$5,$6,NOW()) ON CONFLICT (user_id) DO UPDATE SET gender=EXCLUDED.gender, looking_for=EXCLUDED.looking_for, location=EXCLUDED.location, interests=EXCLUDED.interests, nickname=EXCLUDED.nickname, joined_at=NOW()`, [userId, gender || "any", looking_for || "any", location || "any", interests, nickname]);
-    const match = await tryFindMatch(userId, gender || "any", looking_for || "any", location || "any", interests);
-    if (match) return res.json({ matched: true, peerId: match.peerId, channel: match.channel });
-    return res.json({ matched: false, locationUsed: location });
+    
+    // Add to local queue for socket matching
+    const socketId = await getUserSocketId(userId);
+    const queueEntry = {
+      userId,
+      socketId: socketId || "",
+      gender: gender || "any",
+      looking_for: looking_for || "any",
+      location: location || "any",
+      interests,
+      nickname,
+      username: req.user.username || "User",
+      avatar: req.user.avatar || "",
+      ts: Date.now(),
+    };
+    
+    localMatchQueue.set(userId, queueEntry);
+    if (useRedisForMatching) {
+      await redisQueueAdd(queueEntry);
+    }
+    
+    await pool.query(
+      `INSERT INTO queue (user_id, gender, looking_for, location, interests, nickname, joined_at) VALUES ($1,$2,$3,$4,$5,$6,NOW()) ON CONFLICT (user_id) DO UPDATE SET gender=EXCLUDED.gender, looking_for=EXCLUDED.looking_for, location=EXCLUDED.location, interests=EXCLUDED.interests, nickname=EXCLUDED.nickname, joined_at=NOW()`,
+      [userId, gender || "any", looking_for || "any", location || "any", interests, nickname]
+    );
+    
+    // Try to match
+    const match = await tryMatchForUser(userId);
+    if (match) {
+      return res.json({ matched: true, peerId: match.peerId, channel: match.channel });
+    }
+    
+    return res.json({ matched: false, locationUsed: location, deprecated: true, useSocket: true });
   } catch (err) { console.error(err); res.status(500).json({ error: "enqueue failed" }); }
 });
 
 app.get("/queue/check", requireAuth, async (req, res) => {
+  // DEPRECATED: Matches are now pushed via socket events
+  console.warn("⚠️  DEPRECATED: /queue/check called - use socket events instead");
+  
   try {
     const userId = String(req.user.id);
     const { rows } = await pool.query("SELECT * FROM matches WHERE (user_a=$1 OR user_b=$1) AND created_at > NOW() - INTERVAL '30 seconds' AND ended_at IS NULL LIMIT 1", [userId]);
@@ -822,12 +1356,18 @@ app.get("/queue/check", requireAuth, async (req, res) => {
       const { rows: peerRows } = await pool.query("SELECT username, nickname, avatar, gender, location, interests FROM users WHERE id=$1", [peerId]);
       return res.json({ matched: true, peerId, channel: match.channel_name, peerInfo: peerRows[0] });
     }
-    return res.json({ matched: false });
+    return res.json({ matched: false, deprecated: true, useSocket: true });
   } catch (err) { console.error(err); res.status(500).json({ error: "queue check failed" }); }
 });
 
 app.post("/queue/leave", requireAuth, async (req, res) => {
-  try { await pool.query("DELETE FROM queue WHERE user_id=$1", [String(req.user.id)]); return res.json({ ok: true }); } catch (err) { console.error(err); res.status(500).json({ error: "leave failed" }); }
+  // DEPRECATED: Use socket event "leave_queue" instead
+  console.warn("⚠️  DEPRECATED: /queue/leave called - use socket event 'leave_queue' instead");
+  
+  try { 
+    await removeFromQueue(String(req.user.id)); 
+    return res.json({ ok: true, deprecated: true, useSocket: true }); 
+  } catch (err) { console.error(err); res.status(500).json({ error: "leave failed" }); }
 });
 
 // ------------------- AGORA TOKEN GENERATION -------------------
@@ -998,6 +1538,8 @@ app.post("/api/admin/ban", requireAuth, async (req, res) => {
     await pool.query("UPDATE users SET banned_until=$1, ban_reason=$2, updated_at=NOW() WHERE id=$3", [banUntil, "Banned by admin", userId]);
     await pool.query("INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())", [userId, "admin_ban", "Banned by admin"]);
     userCache.del(`user:${userId}`);
+    // Remove from queue
+    await removeFromQueue(userId);
     const socketId = await getUserSocketId(String(userId));
     if (socketId) {
       const targetSocket = io.sockets.sockets.get(socketId);
@@ -1033,12 +1575,98 @@ app.get("/api/user/match-history", requireAuth, async (req, res) => {
   } catch (err) { console.error("Failed to fetch match history:", err); res.status(500).json({ error: "Could not fetch match history" }); }
 });
 
+// ------------------- QUEUE STATS (ADMIN) -------------------
+app.get("/api/admin/queue-stats", requireAuth, async (req, res) => {
+  try {
+    if (req.user.role !== "admin") return res.status(403).json({ error: "Admin access required" });
+    const queueCount = await getQueueCount();
+    const mode = useRedisForMatching ? "redis" : "local";
+    
+    // Get queue breakdown by location
+    let locationBreakdown = {};
+    let genderBreakdown = {};
+    
+    if (useRedisForMatching) {
+      const entries = await redisQueueGetAll();
+      for (const entry of entries) {
+        const loc = entry.location || "any";
+        const gen = entry.gender || "any";
+        locationBreakdown[loc] = (locationBreakdown[loc] || 0) + 1;
+        genderBreakdown[gen] = (genderBreakdown[gen] || 0) + 1;
+      }
+    } else {
+      for (const [_, entry] of localMatchQueue) {
+        const loc = entry.location || "any";
+        const gen = entry.gender || "any";
+        locationBreakdown[loc] = (locationBreakdown[loc] || 0) + 1;
+        genderBreakdown[gen] = (genderBreakdown[gen] || 0) + 1;
+      }
+    }
+    
+    res.json({
+      total: queueCount,
+      mode,
+      byLocation: locationBreakdown,
+      byGender: genderBreakdown,
+      redisConnected: !!redisClient,
+    });
+  } catch (err) { console.error("Failed to get queue stats:", err); res.status(500).json({ error: "Could not get queue stats" }); }
+});
+
 // ------------------- HEALTH CHECK -------------------
 app.get("/health", (req, res) => {
-  res.json({ ok: true, env: process.env.NODE_ENV || "dev", timestamp: new Date().toISOString(), uptime: process.uptime(), redis: redisClient ? "connected" : "not_configured" });
+  res.json({ 
+    ok: true, 
+    env: process.env.NODE_ENV || "dev", 
+    timestamp: new Date().toISOString(), 
+    uptime: process.uptime(), 
+    redis: redisClient ? "connected" : "not_configured",
+    matchmaking: useRedisForMatching ? "redis" : "local",
+    queueSize: localMatchQueue.size,
+  });
 });
 
 // ------------------- SCHEDULED TASKS -------------------
+// Clean up stale queue entries
+cron.schedule("*/5 * * * *", async () => {
+  try {
+    const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
+    
+    // Clean local queue
+    for (const [userId, entry] of localMatchQueue) {
+      if (entry.ts < fiveMinutesAgo) {
+        // Verify user is still connected
+        const socketId = await getUserSocketId(userId);
+        if (!socketId) {
+          localMatchQueue.delete(userId);
+          if (useRedisForMatching) {
+            await redisQueueRemove(userId);
+          }
+          console.log(`🧹 Cleaned stale queue entry: ${userId}`);
+        }
+      }
+    }
+    
+    // Clean Redis queue if enabled
+    if (useRedisForMatching && redisClient) {
+      const staleKeys = await redisClient.keys("matchq:*");
+      for (const key of staleKeys) {
+        const userId = key.replace("matchq:", "");
+        const ts = await redisClient.hGet(key, "ts");
+        if (ts && parseInt(ts) < fiveMinutesAgo) {
+          const socketId = await getUserSocketId(userId);
+          if (!socketId) {
+            await redisQueueRemove(userId);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Queue cleanup error:", err.message);
+  }
+});
+
+// Daily cleanup
 cron.schedule("0 3 * * *", async () => {
   try {
     console.log("Running daily cleanup task");
@@ -1056,8 +1684,16 @@ async function startServer() {
   server.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
     console.log(`   Redis: ${redisClient ? "✅ connected" : "⚠️  not configured"}`);
+    console.log(`   Matchmaking: ${useRedisForMatching ? "🚀 Redis-powered" : "⚡ In-memory mode"}`);
     console.log(`   Stripe: ${stripe ? "✅ configured" : "⚠️  not configured"}`);
     console.log(`   Coinbase: ${ChargeResource ? "✅ configured" : "⚠️  not configured"}`);
+    console.log("");
+    console.log("📱 New socket events:");
+    console.log("   • join_queue - Join matchmaking queue (replaces POST /queue/enqueue)");
+    console.log("   • leave_queue - Leave queue (replaces POST /queue/leave)");
+    console.log("   • queue_status - Check queue position (replaces GET /queue/check)");
+    console.log("   • next - Skip current match and find next");
+    console.log("   • auto_requeue - Auto re-queue with saved preferences");
   });
 }
 startServer().catch((err) => { console.error("Failed to start server:", err); process.exit(1); });
