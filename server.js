@@ -82,9 +82,9 @@ const pool = new pg.Pool({
   ssl: {
     rejectUnauthorized: false,
   },
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
+  max: 10, // lower connection count (safer for production/free tiers)
+  idleTimeoutMillis: 30000, // keep
+  connectionTimeoutMillis: 5000, // increase timeout
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || "super_secret_jwt_key";
@@ -465,14 +465,36 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", async (reason) => {
-    console.log(`❌ User ${user.username} disconnected: ${socket.id} (${reason})`);
+  console.log(`❌ User ${user.username} disconnected: ${socket.id} (${reason})`);
+
+  try {
+    // Mark user offline
     await setUserOffline(String(userId));
+
+    // 🔥 END ACTIVE MATCH
+    await pool.query(
+      `UPDATE matches 
+       SET ended_at = NOW() 
+       WHERE (user_a = $1 OR user_b = $1) 
+       AND ended_at IS NULL`,
+      [userId]
+    );
+
+    // Notify peers in rooms
     const rooms = getSocketRooms(socket);
     for (const room of rooms) {
-      socket.to(room).emit("peer_left", { socketId: socket.id, userId: userId });
+      socket.to(room).emit("peer_left", {
+        socketId: socket.id,
+        userId: userId,
+      });
     }
-    pool.query("DELETE FROM queue WHERE user_id=$1", [String(userId)]).catch(() => {});
-  });
+
+    // Remove from queue
+    await pool.query("DELETE FROM queue WHERE user_id=$1", [String(userId)]);
+  } catch (err) {
+    console.error("Disconnect cleanup error:", err);
+  }
+});
 
   socket.on("message", async ({ room, text }) => {
     if (!userId) return socket.emit("error", { message: "Not authenticated" });
