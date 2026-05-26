@@ -114,6 +114,16 @@ const ANTI_REPEAT_WINDOW_HOURS = 2;  // Don't match same user within 2 hours
 const MAX_CANDIDATES_TO_SCAN = 100;  // Max candidates to evaluate per match
 const MATCH_LOCK_TTL = 5;           // Seconds to hold match lock
 
+// UPDATED: Coin costs for gifts
+const GIFT_COIN_COSTS = {
+  rose: 10,
+  heart: 25,
+  star: 50,
+  diamond: 100,
+  crown: 200,
+  rocket: 500
+};
+
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
 let ChargeResource = null;
@@ -1442,23 +1452,59 @@ app.post("/api/pay-unban", async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: "Coinbase payment creation failed" }); }
 });
 
+// ------------------- UPDATED: COIN-BASED GIFT CHECKOUT -------------------
 app.post("/api/create-gift-checkout", requireAuth, async (req, res) => {
   try {
-    if (!stripe) return res.status(503).json({ error: "Payment system unavailable" });
     const { giftType, recipientId } = req.body;
-    const giftPrices = { rose: 2.99, bear: 4.99, lion: 9.99 };
-    const price = giftPrices[giftType] || 2.99;
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ["card"],
-      line_items: [{ price_data: { currency: "usd", product_data: { name: `Virtual ${giftType} Gift`, description: `Sent to user ${recipientId}` }, unit_amount: Math.round(price * 100) }, quantity: 1 }],
-      mode: "payment",
-      success_url: `${process.env.FRONTEND_URL}?gift=success&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.FRONTEND_URL}?gift=cancelled`,
-      customer_email: req.user.email,
-      metadata: { userId: String(req.user.id), recipientId: String(recipientId), giftType },
-    });
-    res.json({ url: session.url });
-  } catch (error) { res.status(500).json({ error: "Failed to create gift payment" }); }
+    
+    // Validate gift type
+    const cost = GIFT_COIN_COSTS[giftType];
+    if (!cost) {
+      return res.status(400).json({ error: "Invalid gift type" });
+    }
+
+    if (!recipientId) {
+      return res.status(400).json({ error: "Recipient ID required" });
+    }
+
+    // Check if user has enough coins
+    if (req.user.coins < cost) {
+      return res.status(400).json({ 
+        error: "Insufficient coins. Please purchase more coins.", 
+        code: "INSUFFICIENT_FUNDS" 
+      });
+    }
+
+    // Deduct coins from sender
+    await pool.query(
+      "UPDATE users SET coins = coins - $1, updated_at = NOW() WHERE id = $2",
+      [cost, req.user.id]
+    );
+
+    // Log the transaction
+    await pool.query(
+      "INSERT INTO coin_transactions (user_id, coins, amount, transaction_type, gift_type, recipient_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, NOW())",
+      [req.user.id, -cost, 0, "gift_sent", giftType, String(recipientId)]
+    );
+
+    // Clear cache for sender
+    userCache.del(`user:${req.user.id}`);
+
+    // Notify recipient via Socket.IO
+    const recipientSocketId = await getUserSocketId(String(recipientId));
+    if (recipientSocketId) {
+      io.to(recipientSocketId).emit("gift_received", {
+        giftType,
+        senderId: req.user.id,
+        senderName: req.user.username || "Someone"
+      });
+    }
+
+    res.json({ success: true, newBalance: req.user.coins - cost });
+  } catch (error) {
+    console.error("Error sending gift:", error);
+    res.status(500).json({ error: "Failed to send gift" });
+  }
 });
 
 app.post("/api/coinbase-webhook", express.raw({ type: "application/json" }), async (req, res) => {
