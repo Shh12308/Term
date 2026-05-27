@@ -88,6 +88,12 @@ const pool = new pg.Pool({
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || "super_secret_jwt_key";
+
+// Check if OpenAI key is valid to prevent 401 errors
+const IS_MODERATION_ENABLED = process.env.OPENAI_API_KEY && 
+                               !process.env.OPENAI_API_KEY.includes('sk-xxxx') &&
+                               !process.env.OPENAI_API_KEY.includes('sk-test');
+
 const OPENAI = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY || "",
   timeout: 30000,
@@ -105,16 +111,16 @@ const MIN_AGE_FOR_VIDEO = 18;
 
 // Matchmaking config
 const MATCH_WEIGHTS = {
-  location: 40,      // 40% weight for same location
-  interests: 30,     // 30% weight for shared interests
-  freshness: 20,     // 20% weight for queue time (prefer waiting users)
-  gender: 10,        // 10% weight for gender preference match
+  location: 40,
+  interests: 30,
+  freshness: 20,
+  gender: 10,
 };
-const ANTI_REPEAT_WINDOW_HOURS = 2;  // Don't match same user within 2 hours
-const MAX_CANDIDATES_TO_SCAN = 100;  // Max candidates to evaluate per match
-const MATCH_LOCK_TTL = 5;           // Seconds to hold match lock
+const ANTI_REPEAT_WINDOW_HOURS = 2;
+const MAX_CANDIDATES_TO_SCAN = 100;
+const MATCH_LOCK_TTL = 5;
 
-// UPDATED: Coin costs for gifts
+// Coin costs for gifts
 const GIFT_COIN_COSTS = {
   rose: 10,
   heart: 25,
@@ -205,19 +211,10 @@ function isInRoom(socket, room) {
 }
 
 // ==========================================
-// 🚀 MATCHMAKING ENGINE (UPGRADED)
+// 🚀 MATCHMAKING ENGINE
 // ==========================================
+const localMatchQueue = new Map();
 
-// In-memory fallback queue (used when Redis unavailable)
-const localMatchQueue = new Map(); // userId -> queueEntry
-
-// Queue entry structure:
-// {
-//   userId, socketId, gender, looking_for, location, interests,
-//   nickname, username, avatar, ts (join timestamp)
-// }
-
-// ------------------- REDIS QUEUE OPERATIONS -------------------
 async function redisQueueAdd(entry) {
   if (!redisClient) return false;
   try {
@@ -235,7 +232,7 @@ async function redisQueueAdd(entry) {
       ts: String(entry.ts),
     });
     await redisClient.zAdd("match_queue", { score: entry.ts, value: String(entry.userId) });
-    await redisClient.expire(key, 3600); // Auto-cleanup after 1 hour
+    await redisClient.expire(key, 3600);
     return true;
   } catch (err) {
     console.error("Redis queue add error:", err.message);
@@ -286,9 +283,8 @@ async function redisQueueGetCount() {
   }
 }
 
-// ------------------- REDIS LOCK -------------------
 async function acquireMatchLock(userId) {
-  if (!redisClient) return true; // No Redis = no lock needed
+  if (!redisClient) return true;
   try {
     const result = await redisClient.set(
       `lock:match:${userId}`,
@@ -309,7 +305,6 @@ async function releaseMatchLock(userId) {
   } catch {}
 }
 
-// ------------------- ANTI-REPEAT CHECK -------------------
 async function getRecentMatchPartners(userId, limit = 20) {
   try {
     const { rows } = await pool.query(
@@ -328,18 +323,15 @@ async function getRecentMatchPartners(userId, limit = 20) {
   }
 }
 
-// ------------------- MATCH SCORING -------------------
 function calculateMatchScore(a, b, aWaitTime, bWaitTime) {
   let score = 0;
 
-  // Location matching (40 points max)
   if (a.location === b.location && a.location !== "any") {
     score += MATCH_WEIGHTS.location;
   } else if (a.location === "any" || b.location === "any") {
-    score += MATCH_WEIGHTS.location * 0.5; // Partial credit for flexible location
+    score += MATCH_WEIGHTS.location * 0.5;
   }
 
-  // Interest overlap (30 points max)
   const aInterests = new Set(a.interests || []);
   const bInterests = new Set(b.interests || []);
   let overlapCount = 0;
@@ -350,12 +342,10 @@ function calculateMatchScore(a, b, aWaitTime, bWaitTime) {
   const interestRatio = overlapCount / maxInterests;
   score += MATCH_WEIGHTS.interests * interestRatio;
 
-  // Freshness/fairness (20 points max) - reward users who waited longer
   const maxWait = Math.max(aWaitTime, bWaitTime, 1000);
   const avgWaitRatio = ((aWaitTime + bWaitTime) / 2) / maxWait;
   score += MATCH_WEIGHTS.freshness * avgWaitRatio;
 
-  // Gender preference matching (10 points max)
   const aWantsB = a.looking_for === "any" || a.looking_for === b.gender;
   const bWantsA = b.looking_for === "any" || b.looking_for === a.gender;
   if (aWantsB && bWantsA) {
@@ -371,7 +361,6 @@ function calculateMatchScore(a, b, aWaitTime, bWaitTime) {
 async function tryMatchForUser(requesterUserId) {
   const now = Date.now();
   
-  // Acquire lock to prevent double-matching
   const lockAcquired = await acquireMatchLock(requesterUserId);
   if (!lockAcquired) {
     console.log(`🔒 Lock busy for user ${requesterUserId}, skipping match attempt`);
@@ -379,7 +368,6 @@ async function tryMatchForUser(requesterUserId) {
   }
 
   try {
-    // Get all queue entries
     let allEntries;
     if (useRedisForMatching) {
       allEntries = await redisQueueGetAll();
@@ -387,16 +375,11 @@ async function tryMatchForUser(requesterUserId) {
       allEntries = Array.from(localMatchQueue.values());
     }
 
-    // Find the requester
     const requester = allEntries.find(e => String(e.userId) === String(requesterUserId));
-    if (!requester) {
-      return null;
-    }
+    if (!requester) return null;
 
-    // Get recent partners to avoid repeat matching
     const recentPartners = await getRecentMatchPartners(requesterUserId);
     
-    // Filter and score candidates
     let bestCandidate = null;
     let bestScore = -1;
     let candidatesEvaluated = 0;
@@ -406,13 +389,11 @@ async function tryMatchForUser(requesterUserId) {
       if (recentPartners.has(String(candidate.userId))) continue;
       if (candidatesEvaluated >= MAX_CANDIDATES_TO_SCAN) break;
 
-      // Basic compatibility check
       const requesterWantsCandidate = requester.looking_for === "any" || requester.looking_for === candidate.gender;
       const candidateWantsRequester = candidate.looking_for === "any" || candidate.looking_for === requester.gender;
       
       if (!requesterWantsCandidate || !candidateWantsRequester) continue;
 
-      // Calculate score
       const aWaitTime = now - (requester.ts || now);
       const bWaitTime = now - (candidate.ts || now);
       const score = calculateMatchScore(requester, candidate, aWaitTime, bWaitTime);
@@ -424,34 +405,24 @@ async function tryMatchForUser(requesterUserId) {
       candidatesEvaluated++;
     }
 
-    if (!bestCandidate || bestScore < 20) {
-      // No suitable match found (minimum score threshold)
-      return null;
-    }
+    if (!bestCandidate || bestScore < 20) return null;
 
-    // Verify both users are still online
     const requesterSocketId = await getUserSocketId(String(requesterUserId));
     const candidateSocketId = await getUserSocketId(String(bestCandidate.userId));
     
     if (!requesterSocketId || !candidateSocketId) {
-      // Clean up stale entries
       if (!requesterSocketId) await removeFromQueue(requesterUserId);
       if (!candidateSocketId) await removeFromQueue(bestCandidate.userId);
       return null;
     }
 
-    // Acquire lock on candidate too
     const candidateLockAcquired = await acquireMatchLock(bestCandidate.userId);
-    if (!candidateLockAcquired) {
-      return null; // Candidate is being matched elsewhere
-    }
+    if (!candidateLockAcquired) return null;
 
     try {
-      // Remove both from queue
       await removeFromQueue(requesterUserId);
       await removeFromQueue(bestCandidate.userId);
 
-      // Create match in DB
       const channelName = `omevo_${Math.min(Number(requesterUserId), Number(bestCandidate.userId))}_${Math.max(Number(requesterUserId), Number(bestCandidate.userId))}_${Date.now()}`;
       
       await pool.query(
@@ -459,7 +430,6 @@ async function tryMatchForUser(requesterUserId) {
         [requesterUserId, bestCandidate.userId, channelName]
       );
 
-      // Build peer info objects
       const requesterInfo = {
         username: requester.username || "User",
         nickname: requester.nickname || "",
@@ -478,7 +448,6 @@ async function tryMatchForUser(requesterUserId) {
         interests: bestCandidate.interests || [],
       };
 
-      // Emit match_found to both users
       io.to(requesterSocketId).emit("match_found", {
         peerId: bestCandidate.userId,
         channel: channelName,
@@ -504,22 +473,17 @@ async function tryMatchForUser(requesterUserId) {
   }
 }
 
-// Remove user from queue (both Redis and local)
 async function removeFromQueue(userId) {
   const uid = String(userId);
   localMatchQueue.delete(uid);
   if (useRedisForMatching) {
     await redisQueueRemove(uid);
   }
-  // Also clean up DB queue for backwards compatibility
   await pool.query("DELETE FROM queue WHERE user_id=$1", [uid]).catch(() => {});
 }
 
-// Get queue count
 async function getQueueCount() {
-  if (useRedisForMatching) {
-    return await redisQueueGetCount();
-  }
+  if (useRedisForMatching) return await redisQueueGetCount();
   return localMatchQueue.size;
 }
 
@@ -652,7 +616,6 @@ passport.use(
   )
 );
 
-// ------------------- JWT HELPER -------------------
 function signJwtForUser(user) {
   return jwt.sign({ id: user.id, email: user.email, provider: user.provider }, JWT_SECRET, { expiresIn: "14d" });
 }
@@ -800,15 +763,10 @@ io.on("connection", (socket) => {
   setUserOnline(String(userId), socket.id);
   socket.emit("authenticated", { userId: userId });
 
-  // ==========================================
-  // 🚀 REAL-TIME QUEUE EVENTS (NEW)
-  // ==========================================
-
   socket.on("join_queue", async (data = {}) => {
     if (!userId) return socket.emit("error", { message: "Not authenticated" });
     
     try {
-      // Check if already in a match
       const { rows: activeMatch } = await pool.query(
         "SELECT * FROM matches WHERE (user_a=$1 OR user_b=$1) AND ended_at IS NULL",
         [userId]
@@ -817,30 +775,25 @@ io.on("connection", (socket) => {
         return socket.emit("error", { message: "You're already in a match" });
       }
 
-      // Check if banned
       if (user.banned_until && new Date(user.banned_until) > new Date()) {
         return socket.emit("error", { message: "Account is banned" });
       }
 
-      // Check age verification
       if (!user.age_verified) {
         return socket.emit("error", { message: "Age verification required for video features" });
       }
 
-      // Validate nickname
       const nickname = data.nickname || user.nickname || "";
       if (nickname && (nickname.length > MAX_NICKNAME_LENGTH || nickname.length < 1)) {
         return socket.emit("error", { message: `Nickname must be between 1 and ${MAX_NICKNAME_LENGTH} characters` });
       }
 
-      // Validate interests
       let interests = data.interests || user.interests || [];
       if (!Array.isArray(interests) || interests.length > MAX_INTERESTS) {
         return socket.emit("error", { message: `You can have up to ${MAX_INTERESTS} interests` });
       }
       interests = interests.filter(i => typeof i === "string" && i.length > 0 && i.length <= 30);
 
-      // Determine location
       let location = data.location || user.location || "any";
       if (!location || location === "any") {
         const ip = socket.handshake.headers["x-forwarded-for"]?.split(",")[0] || socket.handshake.address;
@@ -848,7 +801,6 @@ io.on("connection", (socket) => {
         location = geo?.country?.toLowerCase() || "any";
       }
 
-      // Build queue entry
       const queueEntry = {
         userId: String(userId),
         socketId: socket.id,
@@ -862,14 +814,12 @@ io.on("connection", (socket) => {
         ts: Date.now(),
       };
 
-      // Add to queue
       if (useRedisForMatching) {
         await redisQueueAdd(queueEntry);
       }
       localMatchQueue.set(String(userId), queueEntry);
       socket.data.inQueue = true;
 
-      // Update DB (backwards compatibility)
       await pool.query(
         `INSERT INTO queue (user_id, gender, looking_for, location, interests, nickname, joined_at) 
          VALUES ($1,$2,$3,$4,$5,$6,NOW()) 
@@ -878,13 +828,11 @@ io.on("connection", (socket) => {
         [queueEntry.userId, queueEntry.gender, queueEntry.looking_for, queueEntry.location, queueEntry.interests, queueEntry.nickname]
       );
 
-      // Update user preferences in DB
       await pool.query(
         `UPDATE users SET gender=$1, looking_for=$2, location=$3, interests=$4, nickname=$5, updated_at=NOW() WHERE id=$6`,
         [queueEntry.gender, queueEntry.looking_for, queueEntry.location, queueEntry.interests, queueEntry.nickname, userId]
       );
 
-      // Emit queue status
       const queueCount = await getQueueCount();
       socket.emit("queue_joined", { 
         position: queueCount, 
@@ -894,14 +842,11 @@ io.on("connection", (socket) => {
 
       console.log(`📋 User ${user.username} joined queue (position: ${queueCount})`);
 
-      // 🚀 IMMEDIATELY TRY TO MATCH
       const match = await tryMatchForUser(userId);
       
       if (match) {
-        // Match found! (match_found already emitted by tryMatchForUser)
         console.log(`⚡ Instant match for ${user.username}`);
       } else {
-        // No match yet - client can show waiting UI
         socket.emit("queue_waiting", { 
           position: await getQueueCount(),
           message: "Looking for someone to chat with..." 
@@ -916,7 +861,6 @@ io.on("connection", (socket) => {
 
   socket.on("leave_queue", async () => {
     if (!userId) return;
-    
     try {
       await removeFromQueue(userId);
       socket.data.inQueue = false;
@@ -929,7 +873,6 @@ io.on("connection", (socket) => {
 
   socket.on("queue_status", async () => {
     if (!userId) return;
-    
     try {
       const queueCount = await getQueueCount();
       socket.emit("queue_status", { 
@@ -941,10 +884,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // ==========================================
-  // EXISTING SOCKET EVENTS
-  // ==========================================
-
   socket.on("typing", ({ room }) => {
     if (!room || !isInRoom(socket, room)) return;
     socket.to(room).emit("typing", { uid: userId });
@@ -954,20 +893,14 @@ io.on("connection", (socket) => {
     console.log(`❌ User ${user.username} disconnected: ${socket.id} (${reason})`);
 
     try {
-      // Mark user offline
       await setUserOffline(String(userId));
-
-      // End active match
       await pool.query(
         `UPDATE matches SET ended_at = NOW() WHERE (user_a = $1 OR user_b = $1) AND ended_at IS NULL`,
         [userId]
       );
-
-      // Remove from queue
       await removeFromQueue(userId);
       socket.data.inQueue = false;
 
-      // Notify peers in rooms
       const rooms = getSocketRooms(socket);
       for (const room of rooms) {
         socket.to(room).emit("peer_left", {
@@ -976,7 +909,6 @@ io.on("connection", (socket) => {
         });
       }
 
-      // Also clean up DB queue
       await pool.query("DELETE FROM queue WHERE user_id=$1", [String(userId)]).catch(() => {});
     } catch (err) {
       console.error("Disconnect cleanup error:", err);
@@ -1000,17 +932,21 @@ io.on("connection", (socket) => {
 
       await detectSuspiciousBehavior(userId, "chat_message", { length: text.length });
 
-      const mod = await OPENAI.moderations.create({ model: "omni-moderation-latest", input: text });
-      const flagged = mod.results?.[0]?.categories?.sexual || mod.results?.[0]?.categories?.hate || mod.results?.[0]?.categories?.violence || mod.results?.[0]?.flagged;
+      if (IS_MODERATION_ENABLED) {
+        const mod = await OPENAI.moderations.create({ model: "omni-moderation-latest", input: text });
+        const flagged = mod.results?.[0]?.categories?.sexual || mod.results?.[0]?.categories?.hate || mod.results?.[0]?.categories?.violence || mod.results?.[0]?.flagged;
 
-      if (flagged) {
-        const banReason = `Inappropriate message: ${JSON.stringify(mod.results[0].category_scores)}`;
-        await pool.query("UPDATE users SET banned_until = NOW() + INTERVAL '750 hours', ban_reason=$1 WHERE id=$2", [banReason, userId]);
-        socket.emit("moderation_action", { type: "chat", text, banned: true, duration_hours: BAN_HOURS, reason: banReason });
-        await pool.query("INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())", [userId, "auto_ban", banReason]);
-        userCache.del(`user:${userId}`);
-        socket.disconnect(true);
-        return;
+        if (flagged) {
+          const banReason = `Inappropriate message: ${JSON.stringify(mod.results[0].category_scores)}`;
+          await pool.query("UPDATE users SET banned_until = NOW() + INTERVAL '750 hours', ban_reason=$1 WHERE id=$2", [banReason, userId]);
+          socket.emit("moderation_action", { type: "chat", text, banned: true, duration_hours: BAN_HOURS, reason: banReason });
+          await pool.query("INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())", [userId, "auto_ban", banReason]);
+          userCache.del(`user:${userId}`);
+          socket.disconnect(true);
+          return;
+        }
+      } else {
+        console.warn("OpenAI moderation skipped for chat: Invalid API key.");
       }
 
       const { rows } = await pool.query("INSERT INTO chat_messages (user_id, room_id, message, created_at) VALUES ($1, $2, $3, NOW()) RETURNING *", [userId, targetRoom, text]);
@@ -1063,18 +999,20 @@ io.on("connection", (socket) => {
       const processedImage = await sharp(buffer).resize({ width: 320, height: 240, fit: "inside" }).jpeg({ quality: 70 }).toBuffer();
       const processedBase64 = `data:image/jpeg;base64,${processedImage.toString("base64")}`;
 
-      const mod = await OPENAI.moderations.create({ model: "omni-moderation-latest", input: processedBase64 });
-      const result = mod.results?.[0];
-      const flagged = result?.flagged || result?.categories?.sexual || result?.categories?.violence || result?.categories?.hate;
+      if (IS_MODERATION_ENABLED) {
+        const mod = await OPENAI.moderations.create({ model: "omni-moderation-latest", input: processedBase64 });
+        const result = mod.results?.[0];
+        const flagged = result?.flagged || result?.categories?.sexual || result?.categories?.violence || result?.categories?.hate;
 
-      if (flagged) {
-        const banReason = `Inappropriate content detected`;
-        await pool.query("UPDATE users SET banned_until = NOW() + INTERVAL '750 hours', ban_reason=$1 WHERE id=$2", [banReason, userId]);
-        await pool.query("INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())", [userId, "auto_ban", banReason]);
-        userCache.del(`user:${userId}`);
-        socket.emit("moderation_action", { type: "video", banned: true, duration_hours: BAN_HOURS, reason: banReason, offendingFrame: processedBase64 });
-        socket.disconnect(true);
-        return;
+        if (flagged) {
+          const banReason = `Inappropriate content detected`;
+          await pool.query("UPDATE users SET banned_until = NOW() + INTERVAL '750 hours', ban_reason=$1 WHERE id=$2", [banReason, userId]);
+          await pool.query("INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())", [userId, "auto_ban", banReason]);
+          userCache.del(`user:${userId}`);
+          socket.emit("moderation_action", { type: "video", banned: true, duration_hours: BAN_HOURS, reason: banReason, offendingFrame: processedBase64 });
+          socket.disconnect(true);
+          return;
+        }
       }
 
       const roomSockets = await io.in(targetRoom).fetchSockets();
@@ -1151,28 +1089,21 @@ io.on("connection", (socket) => {
     socket.to(targetRoom).emit("reaction", { type, uid: userId, username: user?.username || "User" });
   });
 
-  // ==========================================
-  // 🚀 NEXT/SKIP - Instant re-queue (NEW)
-  // ==========================================
-
   socket.on("next", async () => {
     if (!userId) return;
     
     try {
-      // End current match
       await pool.query(
         `UPDATE matches SET ended_at = NOW() WHERE (user_a = $1 OR user_b = $1) AND ended_at IS NULL`,
         [userId]
       );
 
-      // Leave current room
       const rooms = getSocketRooms(socket);
       for (const room of rooms) {
         socket.leave(room);
         socket.to(room).emit("peer_left", { socketId: socket.id, userId: userId });
       }
 
-      // Auto re-join queue with same preferences
       const cachedEntry = localMatchQueue.get(String(userId));
       const data = cachedEntry ? {
         gender: cachedEntry.gender,
@@ -1183,8 +1114,6 @@ io.on("connection", (socket) => {
       } : {};
 
       socket.emit("next_ready");
-      
-      // Trigger join_queue with previous preferences
       socket.emit("auto_requeue", { preferences: data });
       
     } catch (err) {
@@ -1247,7 +1176,14 @@ async function ensureColumns() {
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS interests TEXT[] DEFAULT '{}'`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS gender VARCHAR(20) DEFAULT 'any'`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS location VARCHAR(50) DEFAULT 'any'`);
+    
+    // CRITICAL: Ensure queue table has columns for new matching logic
     await pool.query(`ALTER TABLE queue ADD COLUMN IF NOT EXISTS looking_for VARCHAR(20) DEFAULT 'any'`);
+    await pool.query(`ALTER TABLE queue ADD COLUMN IF NOT EXISTS gender VARCHAR(20) DEFAULT 'any'`);
+    await pool.query(`ALTER TABLE queue ADD COLUMN IF NOT EXISTS location VARCHAR(50) DEFAULT 'any'`);
+    await pool.query(`ALTER TABLE queue ADD COLUMN IF NOT EXISTS interests TEXT[] DEFAULT '{}'`);
+    await pool.query(`ALTER TABLE queue ADD COLUMN IF NOT EXISTS nickname VARCHAR(20)`);
+    
     await pool.query(`CREATE TABLE IF NOT EXISTS coin_transactions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), coins INTEGER NOT NULL, amount DECIMAL(10,2) NOT NULL, transaction_type VARCHAR(30), gift_type VARCHAR(30), recipient_id VARCHAR(50), transaction_id VARCHAR(255), created_at TIMESTAMP DEFAULT NOW())`);
     console.log("Database columns ensured");
   } catch (error) { console.error("Error ensuring columns:", error); }
@@ -1267,7 +1203,6 @@ app.post("/api/user/spend-coins", requireAuth, async (req, res) => {
   } catch (error) { console.error("Error spending coins:", error); res.status(500).json({ error: "Failed to spend coins" }); }
 });
 
-// ------------------- USER PREFERENCES -------------------
 app.post("/api/user/preferences", requireAuth, async (req, res) => {
   try {
     let { gender = "any", looking_for = "any", location = "any", interests = [], nickname = "" } = req.body;
@@ -1284,7 +1219,6 @@ app.post("/api/user/preferences", requireAuth, async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: "Could not save preferences" }); }
 });
 
-// ------------------- AGE VERIFICATION -------------------
 app.post("/api/user/verify-age", requireAuth, async (req, res) => {
   try {
     const { age } = req.body;
@@ -1297,13 +1231,7 @@ app.post("/api/user/verify-age", requireAuth, async (req, res) => {
   } catch (err) { console.error("Age verification failed:", err); res.status(500).json({ error: "Could not verify age" }); }
 });
 
-// ==========================================
-// 🚀 LEGACY QUEUE ENDPOINTS (DEPRECATED - Keep for backwards compatibility)
-// ==========================================
-
 app.post("/queue/enqueue", requireAuth, async (req, res) => {
-  // DEPRECATED: Use socket event "join_queue" instead
-  // This endpoint still works but logs a warning
   console.warn("⚠️  DEPRECATED: /queue/enqueue called - use socket event 'join_queue' instead");
   
   try {
@@ -1318,7 +1246,6 @@ app.post("/queue/enqueue", requireAuth, async (req, res) => {
     if (!Array.isArray(interests) || interests.length > MAX_INTERESTS) return res.status(400).json({ error: `You can have up to ${MAX_INTERESTS} interests` });
     interests = interests.filter((interest) => typeof interest === "string" && interest.length > 0 && interest.length <= 30);
     
-    // Add to local queue for socket matching
     const socketId = await getUserSocketId(userId);
     const queueEntry = {
       userId,
@@ -1343,7 +1270,6 @@ app.post("/queue/enqueue", requireAuth, async (req, res) => {
       [userId, gender || "any", looking_for || "any", location || "any", interests, nickname]
     );
     
-    // Try to match
     const match = await tryMatchForUser(userId);
     if (match) {
       return res.json({ matched: true, peerId: match.peerId, channel: match.channel });
@@ -1354,7 +1280,6 @@ app.post("/queue/enqueue", requireAuth, async (req, res) => {
 });
 
 app.get("/queue/check", requireAuth, async (req, res) => {
-  // DEPRECATED: Matches are now pushed via socket events
   console.warn("⚠️  DEPRECATED: /queue/check called - use socket events instead");
   
   try {
@@ -1371,7 +1296,6 @@ app.get("/queue/check", requireAuth, async (req, res) => {
 });
 
 app.post("/queue/leave", requireAuth, async (req, res) => {
-  // DEPRECATED: Use socket event "leave_queue" instead
   console.warn("⚠️  DEPRECATED: /queue/leave called - use socket event 'leave_queue' instead");
   
   try { 
@@ -1380,7 +1304,6 @@ app.post("/queue/leave", requireAuth, async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: "leave failed" }); }
 });
 
-// ------------------- AGORA TOKEN GENERATION -------------------
 const { RtcTokenBuilder, RtcRole, RtmTokenBuilder } = agora;
 app.post("/generateToken", requireAuth, async (req, res) => {
   try {
@@ -1400,8 +1323,14 @@ app.post("/user/display-name", requireAuth, async (req, res) => {
   try {
     const { display_name } = req.body;
     if (!display_name || display_name.length > MAX_NICKNAME_LENGTH) return res.status(400).json({ error: `Display name must be between 1 and ${MAX_NICKNAME_LENGTH} characters` });
-    const mod = await OPENAI.moderations.create({ model: "omni-moderation-latest", input: display_name });
-    if (mod.results?.[0]?.flagged) return res.status(400).json({ error: "Display name contains inappropriate content" });
+    
+    if (IS_MODERATION_ENABLED) {
+      const mod = await OPENAI.moderations.create({ model: "omni-moderation-latest", input: display_name });
+      if (mod.results?.[0]?.flagged) return res.status(400).json({ error: "Display name contains inappropriate content" });
+    } else {
+      console.warn("OpenAI moderation skipped for name: Invalid API key.");
+    }
+
     await pool.query("UPDATE users SET username=$1, display_name=$1, updated_at=NOW() WHERE id=$2", [display_name, req.user.id]);
     const updatedUser = { ...req.user, username: display_name, display_name: display_name };
     userCache.set(`user:${req.user.id}`, updatedUser);
@@ -1419,7 +1348,6 @@ app.get("/user/profile", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Could not fetch profile" }); }
 });
 
-// ------------------- AVATAR UPLOAD -------------------
 app.post("/api/user/avatar", requireAuth, async (req, res) => {
   try {
     const { avatarBase64 } = req.body;
@@ -1428,8 +1356,14 @@ app.post("/api/user/avatar", requireAuth, async (req, res) => {
     const metadata = await sharp(buffer).metadata();
     if (metadata.width > 500 || metadata.height > 500) return res.status(400).json({ error: "Avatar must be at most 500x500 pixels" });
     if (!["jpeg", "jpg", "png", "webp"].includes(metadata.format)) return res.status(400).json({ error: "Avatar must be in JPEG, PNG, or WebP format" });
-    const mod = await OPENAI.moderations.create({ model: "omni-moderation-latest", input: avatarBase64 });
-    if (mod.results?.[0]?.flagged) return res.status(400).json({ error: "Avatar contains inappropriate content" });
+    
+    if (IS_MODERATION_ENABLED) {
+      const mod = await OPENAI.moderations.create({ model: "omni-moderation-latest", input: avatarBase64 });
+      if (mod.results?.[0]?.flagged) return res.status(400).json({ error: "Avatar contains inappropriate content" });
+    } else {
+      console.warn("OpenAI moderation skipped for avatar: Invalid API key.");
+    }
+
     const processedImage = await sharp(buffer).resize({ width: 200, height: 200, fit: "cover" }).jpeg({ quality: 80 }).toBuffer();
     const processedBase64 = `data:image/jpeg;base64,${processedImage.toString("base64")}`;
     await pool.query("UPDATE users SET avatar=$1, updated_at=NOW() WHERE id=$2", [processedBase64, req.user.id]);
@@ -1439,7 +1373,6 @@ app.post("/api/user/avatar", requireAuth, async (req, res) => {
   } catch (err) { console.error("Avatar upload failed:", err); res.status(500).json({ error: "Could not upload avatar" }); }
 });
 
-// ------------------- BAN PAYMENT -------------------
 app.post("/api/pay-unban", async (req, res) => {
   try {
     if (!ChargeResource) return res.status(503).json({ error: "Payment system unavailable" });
@@ -1452,12 +1385,10 @@ app.post("/api/pay-unban", async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: "Coinbase payment creation failed" }); }
 });
 
-// ------------------- UPDATED: COIN-BASED GIFT CHECKOUT -------------------
 app.post("/api/create-gift-checkout", requireAuth, async (req, res) => {
   try {
     const { giftType, recipientId } = req.body;
     
-    // Validate gift type
     const cost = GIFT_COIN_COSTS[giftType];
     if (!cost) {
       return res.status(400).json({ error: "Invalid gift type" });
@@ -1467,7 +1398,6 @@ app.post("/api/create-gift-checkout", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Recipient ID required" });
     }
 
-    // Check if user has enough coins
     if (req.user.coins < cost) {
       return res.status(400).json({ 
         error: "Insufficient coins. Please purchase more coins.", 
@@ -1475,22 +1405,18 @@ app.post("/api/create-gift-checkout", requireAuth, async (req, res) => {
       });
     }
 
-    // Deduct coins from sender
     await pool.query(
       "UPDATE users SET coins = coins - $1, updated_at = NOW() WHERE id = $2",
       [cost, req.user.id]
     );
 
-    // Log the transaction
     await pool.query(
       "INSERT INTO coin_transactions (user_id, coins, amount, transaction_type, gift_type, recipient_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, NOW())",
       [req.user.id, -cost, 0, "gift_sent", giftType, String(recipientId)]
     );
 
-    // Clear cache for sender
     userCache.del(`user:${req.user.id}`);
 
-    // Notify recipient via Socket.IO
     const recipientSocketId = await getUserSocketId(String(recipientId));
     if (recipientSocketId) {
       io.to(recipientSocketId).emit("gift_received", {
@@ -1524,7 +1450,6 @@ app.post("/api/coinbase-webhook", express.raw({ type: "application/json" }), asy
   } catch (err) { console.error("Coinbase webhook error:", err); res.status(400).send(`Webhook Error: ${err.message}`); }
 });
 
-// ------------------- MODERATION APPEAL -------------------
 app.post("/api/moderation/appeal", requireAuth, async (req, res) => {
   try {
     const { message } = req.body;
@@ -1536,7 +1461,6 @@ app.post("/api/moderation/appeal", requireAuth, async (req, res) => {
   } catch (err) { console.error("Appeal failed:", err); res.status(500).json({ error: "Could not submit appeal" }); }
 });
 
-// ------------------- ADMIN APPEALS -------------------
 app.get("/api/admin/appeals", requireAuth, async (req, res) => {
   try {
     if (req.user.role !== "admin") return res.status(403).json({ error: "Admin access required" });
@@ -1564,7 +1488,6 @@ app.post("/api/admin/appeals/:id/respond", requireAuth, async (req, res) => {
   } catch (err) { console.error("Failed to respond to appeal:", err); res.status(500).json({ error: "Could not respond to appeal" }); }
 });
 
-// ------------------- ADMIN USER MANAGEMENT -------------------
 app.get("/api/admin/users", requireAuth, async (req, res) => {
   try {
     if (req.user.role !== "admin") return res.status(403).json({ error: "Admin access required" });
@@ -1584,7 +1507,6 @@ app.post("/api/admin/ban", requireAuth, async (req, res) => {
     await pool.query("UPDATE users SET banned_until=$1, ban_reason=$2, updated_at=NOW() WHERE id=$3", [banUntil, "Banned by admin", userId]);
     await pool.query("INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())", [userId, "admin_ban", "Banned by admin"]);
     userCache.del(`user:${userId}`);
-    // Remove from queue
     await removeFromQueue(userId);
     const socketId = await getUserSocketId(String(userId));
     if (socketId) {
@@ -1610,7 +1532,6 @@ app.post("/api/admin/unban", requireAuth, async (req, res) => {
   } catch (err) { console.error("Failed to unban user:", err); res.status(500).json({ error: "Could not unban user" }); }
 });
 
-// ------------------- MATCH HISTORY -------------------
 app.get("/api/user/match-history", requireAuth, async (req, res) => {
   try {
     const { page = 1, limit = 10 } = req.query;
@@ -1621,14 +1542,12 @@ app.get("/api/user/match-history", requireAuth, async (req, res) => {
   } catch (err) { console.error("Failed to fetch match history:", err); res.status(500).json({ error: "Could not fetch match history" }); }
 });
 
-// ------------------- QUEUE STATS (ADMIN) -------------------
 app.get("/api/admin/queue-stats", requireAuth, async (req, res) => {
   try {
     if (req.user.role !== "admin") return res.status(403).json({ error: "Admin access required" });
     const queueCount = await getQueueCount();
     const mode = useRedisForMatching ? "redis" : "local";
     
-    // Get queue breakdown by location
     let locationBreakdown = {};
     let genderBreakdown = {};
     
@@ -1659,7 +1578,6 @@ app.get("/api/admin/queue-stats", requireAuth, async (req, res) => {
   } catch (err) { console.error("Failed to get queue stats:", err); res.status(500).json({ error: "Could not get queue stats" }); }
 });
 
-// ------------------- HEALTH CHECK -------------------
 app.get("/health", (req, res) => {
   res.json({ 
     ok: true, 
@@ -1672,16 +1590,12 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ------------------- SCHEDULED TASKS -------------------
-// Clean up stale queue entries
 cron.schedule("*/5 * * * *", async () => {
   try {
     const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
     
-    // Clean local queue
     for (const [userId, entry] of localMatchQueue) {
       if (entry.ts < fiveMinutesAgo) {
-        // Verify user is still connected
         const socketId = await getUserSocketId(userId);
         if (!socketId) {
           localMatchQueue.delete(userId);
@@ -1693,7 +1607,6 @@ cron.schedule("*/5 * * * *", async () => {
       }
     }
     
-    // Clean Redis queue if enabled
     if (useRedisForMatching && redisClient) {
       const staleKeys = await redisClient.keys("matchq:*");
       for (const key of staleKeys) {
@@ -1712,7 +1625,6 @@ cron.schedule("*/5 * * * *", async () => {
   }
 });
 
-// Daily cleanup
 cron.schedule("0 3 * * *", async () => {
   try {
     console.log("Running daily cleanup task");
@@ -1723,7 +1635,6 @@ cron.schedule("0 3 * * *", async () => {
   } catch (err) { console.error("Error in daily cleanup task:", err); }
 });
 
-// ------------------- START SERVER -------------------
 const PORT = process.env.PORT || 5000;
 async function startServer() {
   await initRedis();
@@ -1735,9 +1646,9 @@ async function startServer() {
     console.log(`   Coinbase: ${ChargeResource ? "✅ configured" : "⚠️  not configured"}`);
     console.log("");
     console.log("📱 New socket events:");
-    console.log("   • join_queue - Join matchmaking queue (replaces POST /queue/enqueue)");
-    console.log("   • leave_queue - Leave queue (replaces POST /queue/leave)");
-    console.log("   • queue_status - Check queue position (replaces GET /queue/check)");
+    console.log("   • join_queue - Join matchmaking queue");
+    console.log("   • leave_queue - Leave queue");
+    console.log("   • queue_status - Check queue position");
     console.log("   • next - Skip current match and find next");
     console.log("   • auto_requeue - Auto re-queue with saved preferences");
   });
