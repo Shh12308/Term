@@ -12,7 +12,7 @@
     "node": "24.x"
   },
   "dependencies": {
-    "await-queue": "^3.0.1",
+   
     "coinbase-commerce-node": "^1.0.4",
     "connect-pg-simple": "^9.0.1",
     "cors": "^2.8.5",
