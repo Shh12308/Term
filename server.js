@@ -17,7 +17,22 @@ import cron from "node-cron";
 import sharp from "sharp";
 import Stripe from "stripe";
 import os from "os";
-import { AwaitQueue } from "await-queue";
+// Simple AwaitQueue implementation to prevent race conditions
+class AwaitQueue {
+  constructor() {
+    this._queue = Promise.resolve();
+  }
+
+  push(task) {
+    const next = this._queue.then(task, task);
+    this._queue = next;
+    return next;
+  }
+
+  close() {
+    // No-op for our simple implementation
+  }
+}
 import * as mediasoup from "mediasoup";
 import mediasoupPrebuilt from "mediasoup-prebuilt";
 
