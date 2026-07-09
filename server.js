@@ -34,7 +34,7 @@ class AwaitQueue {
   }
 }
 import * as mediasoup from "mediasoup";
-import mediasoupPrebuilt from "mediasoup-prebuilt";
+
 
 import { Strategy as GoogleStrategy } from "passport-google-oauth20";
 import { Strategy as DiscordStrategy } from "passport-discord";
