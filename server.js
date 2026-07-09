@@ -9,6 +9,7 @@ import jwt from "jsonwebtoken";
 import cors from "cors";
 import http from "http";
 import { Server as SocketIOServer } from "socket.io";
+import agora from "agora-access-token";
 import CoinbaseCommerce from "coinbase-commerce-node";
 import rateLimit from "express-rate-limit";
 import helmet from "helmet";
@@ -16,25 +17,6 @@ import NodeCache from "node-cache";
 import cron from "node-cron";
 import sharp from "sharp";
 import Stripe from "stripe";
-import os from "os";
-// Simple AwaitQueue implementation to prevent race conditions
-class AwaitQueue {
-  constructor() {
-    this._queue = Promise.resolve();
-  }
-
-  push(task) {
-    const next = this._queue.then(task, task);
-    this._queue = next;
-    return next;
-  }
-
-  close() {
-    // No-op for our simple implementation
-  }
-}
-import * as mediasoup from "mediasoup";
-
 
 import { Strategy as GoogleStrategy } from "passport-google-oauth20";
 import { Strategy as DiscordStrategy } from "passport-discord";
@@ -44,500 +26,7 @@ import OpenAI from "openai";
 
 dotenv.config();
 
-// ============================================================
-// 🎬 MEDIASOUP CONFIGURATION
-// ============================================================
-
-const MEDIASOUP_CONFIG = {
-  worker: {
-    rtcMinPort: parseInt(process.env.MEDIASOUP_WORKER_RTC_MIN_PORT) || 40000,
-    rtcMaxPort: parseInt(process.env.MEDIASOUP_WORKER_RTC_MAX_PORT) || 49999,
-    logLevel: "warn",
-    logTags: ["info", "ice", "dtls", "rtp", "srtp", "rtcp", "rtx", "bwe", "score", "simulcast", "svc"],
-  },
-  router: {
-    mediaCodecs: [
-      {
-        kind: "audio",
-        mimeType: "audio/opus",
-        clockRate: 48000,
-        channels: 2,
-        parameters: {
-          useinbandfec: 1,
-          usedtx: 1,
-        },
-      },
-      {
-        kind: "video",
-        mimeType: "video/VP8",
-        clockRate: 90000,
-        parameters: {
-          "x-google-start-bitrate": 1000,
-        },
-      },
-      {
-        kind: "video",
-        mimeType: "video/VP9",
-        clockRate: 90000,
-        parameters: {
-          "x-google-start-bitrate": 1000,
-          profileId: 2,
-        },
-      },
-      {
-        kind: "video",
-        mimeType: "video/H264",
-        clockRate: 90000,
-        parameters: {
-          "packetization-mode": 1,
-          "profile-level-id": "4d0032",
-          "x-google-start-bitrate": 1000,
-        },
-      },
-    ],
-  },
-  webRtcTransport: {
-    listenIps: [
-      {
-        ip: "0.0.0.0",
-        announcedIp: process.env.MEDIASOUP_ANNOUNCED_IP || undefined,
-      },
-    ],
-    initialAvailableOutgoingBitrate: 1000000,
-    minimumAvailableOutgoingBitrate: 600000,
-    maxSctpMessageSize: 262144,
-    enableUdp: true,
-    enableTcp: true,
-    preferUdp: true,
-  },
-  plainTransport: {
-    listenIp: {
-      ip: "0.0.0.0",
-      announcedIp: process.env.MEDIASOUP_ANNOUNCED_IP || undefined,
-    },
-  },
-};
-
-// ============================================================
-// 🏠 MEDIASOUP ROOM & PEER MANAGEMENT
-// ============================================================
-
-class MediaSoupRoom {
-  constructor(roomId, router) {
-    this.roomId = roomId;
-    this.router = router;
-    this.peers = new Map(); // peerId -> Peer
-    this.createdAt = Date.now();
-    this.closed = false;
-  }
-
-  addPeer(peer) {
-    this.peers.set(peer.id, peer);
-  }
-
-  removePeer(peerId) {
-    const peer = this.peers.get(peerId);
-    if (peer) {
-      peer.close();
-      this.peers.delete(peerId);
-    }
-  }
-
-  getPeer(peerId) {
-    return this.peers.get(peerId);
-  }
-
-  getPeers() {
-    return Array.from(this.peers.values());
-  }
-
-  close() {
-    this.closed = true;
-    for (const peer of this.peers.values()) {
-      peer.close();
-    }
-    this.peers.clear();
-    this.router.close().catch(() => {});
-  }
-}
-
-class MediaSoupPeer {
-  constructor({ id, socket, room, user }) {
-    this.id = id;
-    this.socket = socket;
-    this.room = room;
-    this.user = user;
-    this.sendTransport = null;
-    this.recvTransport = null;
-    this.producers = new Map(); // producerId -> Producer
-    this.consumers = new Map(); // consumerId -> Consumer
-    this.dataProducers = new Map();
-    this.dataConsumers = new Map();
-    this.closed = false;
-  }
-
-  close() {
-    this.closed = true;
-    
-    for (const producer of this.producers.values()) {
-      producer.close().catch(() => {});
-    }
-    this.producers.clear();
-
-    for (const consumer of this.consumers.values()) {
-      consumer.close().catch(() => {});
-    }
-    this.consumers.clear();
-
-    for (const dataProducer of this.dataProducers.values()) {
-      dataProducer.close().catch(() => {});
-    }
-    this.dataProducers.clear();
-
-    for (const dataConsumer of this.dataConsumers.values()) {
-      dataConsumer.close().catch(() => {});
-    }
-    this.dataConsumers.clear();
-
-    if (this.sendTransport) {
-      this.sendTransport.close().catch(() => {});
-    }
-    if (this.recvTransport) {
-      this.recvTransport.close().catch(() => {});
-    }
-  }
-
-  getJson() {
-    return {
-      id: this.id,
-      userId: this.user?.id,
-      username: this.user?.username || "User",
-      nickname: this.user?.nickname || "",
-      avatar: this.user?.avatar || "",
-      gender: this.user?.gender || "any",
-      location: this.user?.location || "any",
-      interests: this.user?.interests || [],
-      producers: Array.from(this.producers.keys()),
-      consumers: Array.from(this.consumers.keys()),
-    };
-  }
-}
-
-// ============================================================
-// 🚀 GLOBAL MEDIASOUP STATE
-// ============================================================
-
-let mediasoupWorker = null;
-let mediasoupWorkers = [];
-let nextWorkerIndex = 0;
-const rooms = new Map(); // roomId -> MediaSoupRoom
-const peerQueues = new Map(); // peerId -> AwaitQueue (prevents race conditions)
-
-function getPeerQueue(peerId) {
-  if (!peerQueues.has(peerId)) {
-    peerQueues.set(peerId, new AwaitQueue());
-  }
-  return peerQueues.get(peerId);
-}
-
-function removePeerQueue(peerId) {
-  const queue = peerQueues.get(peerId);
-  if (queue) {
-    queue.close().catch(() => {});
-    peerQueues.delete(peerId);
-  }
-}
-
-// ============================================================
-// 🏭 MEDIASOUP WORKER SETUP
-// ============================================================
-
-async function createMediasoupWorkers() {
-  const numWorkers = Math.min(os.cpus().length, 4);
-  console.log(`🎬 Creating ${numWorkers} mediasoup worker(s)...`);
-
-  for (let i = 0; i < numWorkers; i++) {
-    try {
-      const worker = await mediasoup.createWorker({
-        logLevel: MEDIASOUP_CONFIG.worker.logLevel,
-        logTags: MEDIASOUP_CONFIG.worker.logTags,
-        rtcMinPort: MEDIASOUP_CONFIG.worker.rtcMinPort,
-        rtcMaxPort: MEDIASOUP_CONFIG.worker.rtcMaxPort,
-      });
-
-      worker.on("died", () => {
-        console.error(`❌ Mediasoup worker ${worker.pid} died!`);
-        process.exit(1);
-      });
-
-      mediasoupWorkers.push(worker);
-      console.log(`✅ Mediasoup worker ${i + 1} created (pid: ${worker.pid})`);
-    } catch (err) {
-      console.error(`❌ Failed to create mediasoup worker ${i + 1}:`, err.message);
-    }
-  }
-
-  if (mediasoupWorkers.length === 0) {
-    throw new Error("Failed to create any mediasoup workers");
-  }
-
-  mediasoupWorker = mediasoupWorkers[0];
-  console.log(`🎬 Mediasoup initialized with ${mediasoupWorkers.length} worker(s)`);
-}
-
-async function getMediasoupWorker() {
-  const worker = mediasoupWorkers[nextWorkerIndex];
-  nextWorkerIndex = (nextWorkerIndex + 1) % mediasoupWorkers.length;
-  return worker;
-}
-
-async function createRoom(roomId) {
-  if (rooms.has(roomId)) {
-    return rooms.get(roomId);
-  }
-
-  const worker = await getMediasoupWorker();
-  const router = await worker.createRouter({
-    mediaCodecs: MEDIASOUP_CONFIG.router.mediaCodecs,
-  });
-
-  const room = new MediaSoupRoom(roomId, router);
-  rooms.set(roomId, room);
-
-  // Audio levels observer for active speaker detection
-  room.audioLevelObserver = await router.createAudioLevelObserver({
-    maxEntries: 1,
-    threshold: -80,
-    interval: 1000,
-  });
-
-  room.audioLevelObserver.on("volumes", (volumes) => {
-    for (const { producer, volume } of volumes) {
-      const peerId = producer.appData.peerId;
-      const peer = room.getPeer(peerId);
-      if (peer && !peer.closed) {
-        peer.socket.emit("audio-level", { 
-          peerId, 
-          volume: Math.round(volume) 
-        });
-      }
-    }
-  });
-
-  console.log(`🎬 Room created: ${roomId} (workers: ${mediasoupWorkers.length})`);
-  return room;
-}
-
-async function closeRoom(roomId) {
-  const room = rooms.get(roomId);
-  if (room) {
-    room.close();
-    rooms.delete(roomId);
-    console.log(`🎬 Room closed: ${roomId}`);
-  }
-}
-
-// ============================================================
-// 🎬 MEDIASOUP TRANSPORT & PRODUCER/CONSUMER HELPERS
-// ============================================================
-
-async function createWebRtcTransport(router, peerSocket) {
-  const transport = await router.createWebRtcTransport(MEDIASOUP_CONFIG.webRtcTransport);
-
-  transport.on("dtlsstatechange", (dtlsState) => {
-    if (dtlsState === "closed" || dtlsState === "failed") {
-      transport.close().catch(() => {});
-    }
-  });
-
-  transport.on("icestatechange", (iceState) => {
-    if (iceState === "failed" || iceState === "disconnected") {
-      // Don't immediately close - ICE can recover
-      peerSocket.emit("ice-state-change", { iceState });
-    }
-  });
-
-  return {
-    transport,
-    params: {
-      id: transport.id,
-      iceParameters: transport.iceParameters,
-      iceCandidates: transport.iceCandidates,
-      dtlsParameters: transport.dtlsParameters,
-      sctpParameters: transport.sctpParameters,
-    },
-  };
-}
-
-async function createProducer(peer, { kind, rtpParameters, appData = {} }) {
-  const producer = await peer.sendTransport.produce({
-    kind,
-    rtpParameters,
-    appData: { ...appData, peerId: peer.id },
-  });
-
-  producer.on("score", (score) => {
-    peer.socket.emit("producer-score", { producerId: producer.id, score });
-  });
-
-  producer.on("videoorientationchange", (videoOrientation) => {
-    peer.socket.emit("video-orientation", { producerId: producer.id, videoOrientation });
-  });
-
-  peer.producers.set(producer.id, producer);
-
-  // If audio producer, observe it for active speaker
-  if (kind === "audio" && peer.room.audioLevelObserver) {
-    try {
-      await peer.room.audioLevelObserver.addProducer({ producerId: producer.id });
-    } catch (err) {
-      console.error("Failed to add producer to audio level observer:", err.message);
-    }
-  }
-
-  return producer;
-}
-
-async function consume({ peer, producer, rtpCapabilities }) {
-  if (!peer.room.router.canConsume({ producerId: producer.id, rtpCapabilities })) {
-    throw new Error("Cannot consume this producer");
-  }
-
-  const consumer = await peer.recvTransport.consume({
-    producerId: producer.id,
-    rtpCapabilities,
-    paused: true, // Start paused, resume after client ack
-  });
-
-  consumer.on("score", (score) => {
-    peer.socket.emit("consumer-score", { consumerId: consumer.id, score });
-  });
-
-  consumer.on("layerschange", (layers) => {
-    peer.socket.emit("consumer-layers-change", { consumerId: consumer.id, layers });
-  });
-
-  peer.consumers.set(consumer.id, consumer);
-
-  return {
-    consumer,
-    params: {
-      id: consumer.id,
-      producerId: producer.id,
-      kind: consumer.kind,
-      rtpParameters: consumer.rtpParameters,
-      type: consumer.type,
-      producerPaused: consumer.producerPaused,
-    },
-  };
-}
-
-async function createDataProducer(peer, { label, protocol, appData = {}, sctpStreamParameters }) {
-  const dataProducer = await peer.sendTransport.produceData({
-    label,
-    protocol,
-    sctpStreamParameters,
-    appData: { ...appData, peerId: peer.id },
-  });
-
-  peer.dataProducers.set(dataProducer.id, dataProducer);
-  return dataProducer;
-}
-
-async function consumeData({ peer, dataProducer }) {
-  const dataConsumer = await peer.recvTransport.consumeData({
-    dataProducerId: dataProducer.id,
-  });
-
-  peer.dataConsumers.set(dataConsumer.id, dataConsumer);
-  
-  dataConsumer.on("message", (message, ppid) => {
-    peer.socket.emit("data-message", {
-      fromPeerId: dataProducer.appData.peerId,
-      label: dataConsumer.label,
-      message,
-      ppid,
-    });
-  });
-
-  return {
-    dataConsumer,
-    params: {
-      id: dataConsumer.id,
-      dataProducerId: dataProducer.id,
-      label: dataConsumer.label,
-      protocol: dataConsumer.protocol,
-      sctpStreamParameters: dataConsumer.sctpStreamParameters,
-    },
-  };
-}
-
-// ============================================================
-// 📡 BROADCAST HELPERS
-// ============================================================
-
-async function broadcastNewPeer(room, newPeer) {
-  const peerInfo = newPeer.getJson();
-  for (const peer of room.getPeers()) {
-    if (peer.id !== newPeer.id && !peer.closed) {
-      peer.socket.emit("new-peer", { peer: peerInfo });
-    }
-  }
-}
-
-async function closePeerAndNotify(peer) {
-  const room = peer.room;
-  const peerInfo = peer.getJson();
-
-  // Close all consumers of this peer
-  for (const consumer of peer.consumers.values()) {
-    consumer.close().catch(() => {});
-  }
-  peer.consumers.clear();
-
-  // Close all data consumers
-  for (const dataConsumer of peer.dataConsumers.values()) {
-    dataConsumer.close().catch(() => {});
-  }
-  peer.dataConsumers.clear();
-
-  // Close transports
-  if (peer.sendTransport) peer.sendTransport.close().catch(() => {});
-  if (peer.recvTransport) peer.recvTransport.close().catch(() => {});
-
-  // Notify other peers
-  for (const otherPeer of room.getPeers()) {
-    if (otherPeer.id !== peer.id && !otherPeer.closed) {
-      // Close all consumers that were consuming this peer's producers
-      for (const consumer of otherPeer.consumers.values()) {
-        if (consumer.appData?.peerId === peer.id) {
-          otherPeer.socket.emit("consumer-closed", { consumerId: consumer.id });
-          consumer.close().catch(() => {});
-        }
-      }
-
-      // Close data consumers
-      for (const dataConsumer of otherPeer.dataConsumers.values()) {
-        if (dataConsumer.appData?.peerId === peer.id) {
-          otherPeer.socket.emit("data-consumer-closed", { dataConsumerId: dataConsumer.id });
-          dataConsumer.close().catch(() => {});
-        }
-      }
-
-      otherPeer.consumers.delete(peer.id);
-      otherPeer.socket.emit("peer-left", { peerId: peer.id, peer: peerInfo });
-    }
-  }
-
-  // Remove peer from room
-  room.removePeer(peer.id);
-  removePeerQueue(peer.id);
-}
-
-// ============================================================
-// 🚀 REST OF YOUR APP CONFIG
-// ============================================================
-
+// ------------------- CONFIG -------------------
 const app = express();
 app.use(
   helmet({
@@ -548,7 +37,6 @@ app.use(
         styleSrc: ["'self'", "'unsafe-inline'"],
         imgSrc: ["'self'", "data:", "https:"],
         connectSrc: ["'self'", "wss:", "https://api.openai.com"],
-        mediaSrc: ["'self'", "blob:"],
       },
     },
   })
@@ -562,6 +50,7 @@ app.use(
   })
 );
 
+// Rate limiting
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
@@ -586,19 +75,21 @@ const io = new SocketIOServer(server, {
   },
   pingTimeout: 60000,
   pingInterval: 25000,
-  maxPayload: 10 * 1024 * 1024,
 });
 
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  max: 20,
+  ssl: {
+    rejectUnauthorized: false,
+  },
+  max: 10,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || "super_secret_jwt_key";
 
+// Check if OpenAI key is valid to prevent 401 errors
 const IS_MODERATION_ENABLED = process.env.OPENAI_API_KEY && 
                                !process.env.OPENAI_API_KEY.includes('sk-xxxx') &&
                                !process.env.OPENAI_API_KEY.includes('sk-test');
@@ -609,19 +100,34 @@ const OPENAI = new OpenAI({
   maxRetries: 2,
 });
 
+const AGORA_APP_ID = process.env.AGORA_APP_ID;
+const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE;
+
 const BAN_HOURS = 750;
 const UNBAN_PRICE = 5.99;
 const MAX_INTERESTS = 5;
 const MAX_NICKNAME_LENGTH = 20;
 const MIN_AGE_FOR_VIDEO = 18;
 
-const MATCH_WEIGHTS = { location: 40, interests: 30, freshness: 20, gender: 10 };
+// Matchmaking config
+const MATCH_WEIGHTS = {
+  location: 40,
+  interests: 30,
+  freshness: 20,
+  gender: 10,
+};
 const ANTI_REPEAT_WINDOW_HOURS = 2;
 const MAX_CANDIDATES_TO_SCAN = 100;
 const MATCH_LOCK_TTL = 5;
 
+// Coin costs for gifts
 const GIFT_COIN_COSTS = {
-  rose: 10, heart: 25, star: 50, diamond: 100, crown: 200, rocket: 500
+  rose: 10,
+  heart: 25,
+  star: 50,
+  diamond: 100,
+  crown: 200,
+  rocket: 500
 };
 
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
@@ -639,10 +145,7 @@ if (process.env.COINBASE_COMMERCE_API_KEY) {
 
 const userCache = new NodeCache({ stdTTL: 300, checkperiod: 120 });
 
-// ============================================================
-// 🔄 REDIS & ADAPTER
-// ============================================================
-
+// ------------------- REDIS & ADAPTER -------------------
 let redisClient = null;
 let useRedisForMatching = false;
 
@@ -661,16 +164,13 @@ async function initRedis() {
     redisClient = pubClient;
     io.adapter(createAdapter(pubClient, subClient));
     useRedisForMatching = true;
-    console.log("✅ Socket.IO Redis adapter connected");
+    console.log("✅ Socket.IO Redis adapter connected (matchmaking enabled)");
   } catch (err) {
-    console.warn("⚠️  Redis adapter failed:", err.message);
+    console.warn("⚠️  Redis adapter failed to initialize (falling back to local):", err.message);
   }
 }
 
-// ============================================================
-// 👤 ONLINE TRACKING
-// ============================================================
-
+// ------------------- ONLINE TRACKING -------------------
 const onlineSockets = new Map();
 
 async function setUserOnline(userId, socketId) {
@@ -697,10 +197,7 @@ async function setUserOffline(userId) {
   }
 }
 
-// ============================================================
-// 🏠 ROOM HELPERS
-// ============================================================
-
+// ------------------- ROOM HELPERS -------------------
 function getSocketRooms(socket) {
   const rooms = [];
   for (const room of socket.rooms) {
@@ -713,10 +210,9 @@ function isInRoom(socket, room) {
   return socket.rooms.has(room);
 }
 
-// ============================================================
+// ==========================================
 // 🚀 MATCHMAKING ENGINE
-// ============================================================
-
+// ==========================================
 const localMatchQueue = new Map();
 
 async function redisQueueAdd(entry) {
@@ -780,71 +276,110 @@ async function redisQueueGetAll() {
 
 async function redisQueueGetCount() {
   if (!redisClient) return 0;
-  try { return await redisClient.zCard("match_queue"); } catch { return 0; }
+  try {
+    return await redisClient.zCard("match_queue");
+  } catch {
+    return 0;
+  }
 }
 
 async function acquireMatchLock(userId) {
   if (!redisClient) return true;
   try {
-    const result = await redisClient.set(`lock:match:${userId}`, "1", { NX: true, EX: MATCH_LOCK_TTL });
+    const result = await redisClient.set(
+      `lock:match:${userId}`,
+      "1",
+      { NX: true, EX: MATCH_LOCK_TTL }
+    );
     return result === "OK";
-  } catch (err) { return false; }
+  } catch (err) {
+    console.error("Redis lock error:", err.message);
+    return false;
+  }
 }
 
 async function releaseMatchLock(userId) {
   if (!redisClient) return;
-  try { await redisClient.del(`lock:match:${userId}`); } catch {}
+  try {
+    await redisClient.del(`lock:match:${userId}`);
+  } catch {}
 }
 
 async function getRecentMatchPartners(userId, limit = 20) {
   try {
     const { rows } = await pool.query(
       `SELECT CASE WHEN user_a = $1 THEN user_b ELSE user_a END as partner_id
-       FROM matches WHERE (user_a = $1 OR user_b = $1)
+       FROM matches
+       WHERE (user_a = $1 OR user_b = $1)
        AND created_at > NOW() - INTERVAL '${ANTI_REPEAT_WINDOW_HOURS} hours'
-       ORDER BY created_at DESC LIMIT $2`,
+       ORDER BY created_at DESC
+       LIMIT $2`,
       [userId, limit]
     );
     return new Set(rows.map(r => String(r.partner_id)));
   } catch (err) {
+    console.error("Recent matches fetch error:", err.message);
     return new Set();
   }
 }
 
 function calculateMatchScore(a, b, aWaitTime, bWaitTime) {
   let score = 0;
-  if (a.location === b.location && a.location !== "any") score += MATCH_WEIGHTS.location;
-  else if (a.location === "any" || b.location === "any") score += MATCH_WEIGHTS.location * 0.5;
+
+  if (a.location === b.location && a.location !== "any") {
+    score += MATCH_WEIGHTS.location;
+  } else if (a.location === "any" || b.location === "any") {
+    score += MATCH_WEIGHTS.location * 0.5;
+  }
 
   const aInterests = new Set(a.interests || []);
   const bInterests = new Set(b.interests || []);
   let overlapCount = 0;
-  for (const interest of aInterests) { if (bInterests.has(interest)) overlapCount++; }
+  for (const interest of aInterests) {
+    if (bInterests.has(interest)) overlapCount++;
+  }
   const maxInterests = Math.max(aInterests.size, bInterests.size, 1);
-  score += MATCH_WEIGHTS.interests * (overlapCount / maxInterests);
+  const interestRatio = overlapCount / maxInterests;
+  score += MATCH_WEIGHTS.interests * interestRatio;
 
   const maxWait = Math.max(aWaitTime, bWaitTime, 1000);
-  score += MATCH_WEIGHTS.freshness * ((aWaitTime + bWaitTime) / 2) / maxWait;
+  const avgWaitRatio = ((aWaitTime + bWaitTime) / 2) / maxWait;
+  score += MATCH_WEIGHTS.freshness * avgWaitRatio;
 
   const aWantsB = a.looking_for === "any" || a.looking_for === b.gender;
   const bWantsA = b.looking_for === "any" || b.looking_for === a.gender;
-  if (aWantsB && bWantsA) score += MATCH_WEIGHTS.gender;
-  else if (aWantsB || bWantsA) score += MATCH_WEIGHTS.gender * 0.5;
+  if (aWantsB && bWantsA) {
+    score += MATCH_WEIGHTS.gender;
+  } else if (aWantsB || bWantsA) {
+    score += MATCH_WEIGHTS.gender * 0.5;
+  }
 
   return score;
 }
 
+// ------------------- CORE MATCHING ENGINE -------------------
 async function tryMatchForUser(requesterUserId) {
   const now = Date.now();
+  
   const lockAcquired = await acquireMatchLock(requesterUserId);
-  if (!lockAcquired) return null;
+  if (!lockAcquired) {
+    console.log(`🔒 Lock busy for user ${requesterUserId}, skipping match attempt`);
+    return null;
+  }
 
   try {
-    let allEntries = useRedisForMatching ? await redisQueueGetAll() : Array.from(localMatchQueue.values());
+    let allEntries;
+    if (useRedisForMatching) {
+      allEntries = await redisQueueGetAll();
+    } else {
+      allEntries = Array.from(localMatchQueue.values());
+    }
+
     const requester = allEntries.find(e => String(e.userId) === String(requesterUserId));
     if (!requester) return null;
 
     const recentPartners = await getRecentMatchPartners(requesterUserId);
+    
     let bestCandidate = null;
     let bestScore = -1;
     let candidatesEvaluated = 0;
@@ -856,10 +391,17 @@ async function tryMatchForUser(requesterUserId) {
 
       const requesterWantsCandidate = requester.looking_for === "any" || requester.looking_for === candidate.gender;
       const candidateWantsRequester = candidate.looking_for === "any" || candidate.looking_for === requester.gender;
+      
       if (!requesterWantsCandidate || !candidateWantsRequester) continue;
 
-      const score = calculateMatchScore(requester, candidate, now - (requester.ts || now), now - (candidate.ts || now));
-      if (score > bestScore) { bestScore = score; bestCandidate = candidate; }
+      const aWaitTime = now - (requester.ts || now);
+      const bWaitTime = now - (candidate.ts || now);
+      const score = calculateMatchScore(requester, candidate, aWaitTime, bWaitTime);
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestCandidate = candidate;
+      }
       candidatesEvaluated++;
     }
 
@@ -867,6 +409,7 @@ async function tryMatchForUser(requesterUserId) {
 
     const requesterSocketId = await getUserSocketId(String(requesterUserId));
     const candidateSocketId = await getUserSocketId(String(bestCandidate.userId));
+    
     if (!requesterSocketId || !candidateSocketId) {
       if (!requesterSocketId) await removeFromQueue(requesterUserId);
       if (!candidateSocketId) await removeFromQueue(bestCandidate.userId);
@@ -880,46 +423,48 @@ async function tryMatchForUser(requesterUserId) {
       await removeFromQueue(requesterUserId);
       await removeFromQueue(bestCandidate.userId);
 
-      const roomId = `room_${Math.min(Number(requesterUserId), Number(bestCandidate.userId))}_${Math.max(Number(requesterUserId), Number(bestCandidate.userId))}_${Date.now()}`;
+      const channelName = `omevo_${Math.min(Number(requesterUserId), Number(bestCandidate.userId))}_${Math.max(Number(requesterUserId), Number(bestCandidate.userId))}_${Date.now()}`;
       
       await pool.query(
         `INSERT INTO matches (user_a, user_b, channel_name, created_at) VALUES ($1, $2, $3, NOW())`,
-        [requesterUserId, bestCandidate.userId, roomId]
+        [requesterUserId, bestCandidate.userId, channelName]
       );
 
-      // Create mediasoup room
-      await createRoom(roomId);
-
       const requesterInfo = {
-        username: requester.username || "User", nickname: requester.nickname || "",
-        avatar: requester.avatar || "", gender: requester.gender || "any",
-        location: requester.location || "any", interests: requester.interests || [],
+        username: requester.username || "User",
+        nickname: requester.nickname || "",
+        avatar: requester.avatar || "",
+        gender: requester.gender || "any",
+        location: requester.location || "any",
+        interests: requester.interests || [],
       };
 
       const candidateInfo = {
-        username: bestCandidate.username || "User", nickname: bestCandidate.nickname || "",
-        avatar: bestCandidate.avatar || "", gender: bestCandidate.gender || "any",
-        location: bestCandidate.location || "any", interests: bestCandidate.interests || [],
+        username: bestCandidate.username || "User",
+        nickname: bestCandidate.nickname || "",
+        avatar: bestCandidate.avatar || "",
+        gender: bestCandidate.gender || "any",
+        location: bestCandidate.location || "any",
+        interests: bestCandidate.interests || [],
       };
 
       io.to(requesterSocketId).emit("match_found", {
         peerId: bestCandidate.userId,
-        roomId,
+        channel: channelName,
         peerInfo: candidateInfo,
         score: Math.round(bestScore),
-        signaling: "mediasoup",
       });
 
       io.to(candidateSocketId).emit("match_found", {
         peerId: requesterUserId,
-        roomId,
+        channel: channelName,
         peerInfo: requesterInfo,
         score: Math.round(bestScore),
-        signaling: "mediasoup",
       });
 
-      console.log(`✅ Matched ${requesterUserId} ↔ ${bestCandidate.userId} (room: ${roomId})`);
-      return { peerId: bestCandidate.userId, roomId };
+      console.log(`✅ Matched ${requesterUserId} ↔ ${bestCandidate.userId} (score: ${Math.round(bestScore)})`);
+
+      return { peerId: bestCandidate.userId, channel: channelName };
     } finally {
       await releaseMatchLock(bestCandidate.userId);
     }
@@ -931,26 +476,38 @@ async function tryMatchForUser(requesterUserId) {
 async function removeFromQueue(userId) {
   const uid = String(userId);
   localMatchQueue.delete(uid);
-  if (useRedisForMatching) await redisQueueRemove(uid);
+  if (useRedisForMatching) {
+    await redisQueueRemove(uid);
+  }
   await pool.query("DELETE FROM queue WHERE user_id=$1", [uid]).catch(() => {});
 }
 
 async function getQueueCount() {
-  return useRedisForMatching ? await redisQueueGetCount() : localMatchQueue.size;
+  if (useRedisForMatching) return await redisQueueGetCount();
+  return localMatchQueue.size;
 }
 
-// ============================================================
-// 🔐 SESSION & PASSPORT (unchanged)
-// ============================================================
-
+// ------------------- SESSION & PASSPORT -------------------
 const PGStore = pgSessionImport(session);
 
-app.use(session({
-  store: new PGStore({ pool, tableName: "user_sessions", createTableIfMissing: true }),
-  secret: process.env.SESSION_SECRET || "session_secret_omevo",
-  resave: false, saveUninitialized: false,
-  cookie: { maxAge: 14 * 24 * 60 * 60 * 1000, httpOnly: true, secure: process.env.NODE_ENV === "production", sameSite: "lax" },
-}));
+app.use(
+  session({
+    store: new PGStore({
+      pool: pool,
+      tableName: "user_sessions",
+      createTableIfMissing: true,
+    }),
+    secret: process.env.SESSION_SECRET || "session_secret_omevo",
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      maxAge: 14 * 24 * 60 * 60 * 1000,
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+    },
+  })
+);
 
 app.use(passport.initialize());
 app.use(passport.session());
@@ -966,61 +523,98 @@ passport.deserializeUser(async (id, done) => {
   } catch (err) { done(err, null); }
 });
 
-// Passport strategies
-passport.use(new GoogleStrategy({
-  clientID: process.env.GOOGLE_CLIENT_ID, clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-  callbackURL: process.env.GOOGLE_CALLBACK_URL,
-}, async (accessToken, refreshToken, profile, done) => {
-  try {
-    const email = profile.emails?.[0]?.value || null;
-    const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
-    if (rows.length > 0) {
-      const result = await pool.query(`UPDATE users SET provider='google', provider_id=$1, username=$2, avatar=$3, updated_at=NOW() WHERE id=$4 RETURNING *`,
-        [profile.id, profile.displayName || email, profile.photos?.[0]?.value, rows[0].id]);
-      return done(null, result.rows[0]);
+// ------------------- PASSPORT STRATEGIES -------------------
+passport.use(
+  new GoogleStrategy(
+    {
+      clientID: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+      callbackURL: process.env.GOOGLE_CALLBACK_URL,
+    },
+    async (accessToken, refreshToken, profile, done) => {
+      try {
+        const email = profile.emails?.[0]?.value || null;
+        const providerId = profile.id;
+        const avatar = profile.photos?.[0]?.value || null;
+        const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
+        if (rows.length > 0) {
+          const result = await pool.query(
+            `UPDATE users SET provider='google', provider_id=$1, username=$2, avatar=$3, updated_at=NOW() WHERE id=$4 RETURNING *`,
+            [providerId, profile.displayName || profile.username || email, avatar, rows[0].id]
+          );
+          return done(null, result.rows[0]);
+        }
+        const result = await pool.query(
+          `INSERT INTO users (username, email, provider, provider_id, avatar, created_at, updated_at) VALUES ($1,$2,'google',$3,$4,NOW(),NOW()) RETURNING *`,
+          [profile.displayName || profile.username || email, email, providerId, avatar]
+        );
+        done(null, result.rows[0]);
+      } catch (err) { done(err, null); }
     }
-    const result = await pool.query(`INSERT INTO users (username, email, provider, provider_id, avatar, created_at, updated_at) VALUES ($1,$2,'google',$3,$4,NOW(),NOW()) RETURNING *`,
-      [profile.displayName || email, email, profile.id, profile.photos?.[0]?.value]);
-    done(null, result.rows[0]);
-  } catch (err) { done(err, null); }
-}));
+  )
+);
 
-passport.use(new DiscordStrategy({
-  clientID: process.env.DISCORD_CLIENT_ID, clientSecret: process.env.DISCORD_CLIENT_SECRET,
-  callbackURL: process.env.DISCORD_CALLBACK_URL, scope: ["identify", "email"],
-}, async (accessToken, refreshToken, profile, done) => {
-  try {
-    const email = profile.email || null;
-    const avatar = profile.avatar ? `https://cdn.discordapp.com/avatars/${profile.id}/${profile.avatar}.png` : null;
-    const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
-    if (rows.length > 0) {
-      const result = await pool.query(`UPDATE users SET provider='discord', provider_id=$1, username=$2, avatar=$3, updated_at=NOW() WHERE id=$4 RETURNING *`,
-        [profile.id, profile.username, avatar, rows[0].id]);
-      return done(null, result.rows[0]);
+passport.use(
+  new DiscordStrategy(
+    {
+      clientID: process.env.DISCORD_CLIENT_ID,
+      clientSecret: process.env.DISCORD_CLIENT_SECRET,
+      callbackURL: process.env.DISCORD_CALLBACK_URL,
+      scope: ["identify", "email"],
+    },
+    async (accessToken, refreshToken, profile, done) => {
+      try {
+        const email = profile.email || null;
+        const providerId = profile.id;
+        const avatar = profile.avatar ? `https://cdn.discordapp.com/avatars/${profile.id}/${profile.avatar}.png` : null;
+        const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
+        if (rows.length > 0) {
+          const result = await pool.query(
+            `UPDATE users SET provider='discord', provider_id=$1, username=$2, avatar=$3, updated_at=NOW() WHERE id=$4 RETURNING *`,
+            [providerId, profile.username || profile.displayName, avatar, rows[0].id]
+          );
+          return done(null, result.rows[0]);
+        }
+        const result = await pool.query(
+          `INSERT INTO users (username, email, provider, provider_id, avatar, created_at, updated_at) VALUES ($1,$2,'discord',$3,$4,NOW(),NOW()) RETURNING *`,
+          [profile.username || profile.displayName, email, providerId, avatar]
+        );
+        done(null, result.rows[0]);
+      } catch (err) { done(err, null); }
     }
-    const result = await pool.query(`INSERT INTO users (username, email, provider, provider_id, avatar, created_at, updated_at) VALUES ($1,$2,'discord',$3,$4,NOW(),NOW()) RETURNING *`,
-      [profile.username, email, profile.id, avatar]);
-    done(null, result.rows[0]);
-  } catch (err) { done(err, null); }
-}));
+  )
+);
 
-passport.use(new FacebookStrategy({
-  clientID: process.env.FACEBOOK_APP_ID, clientSecret: process.env.FACEBOOK_APP_SECRET,
-  callbackURL: process.env.FACEBOOK_CALLBACK_URL, profileFields: ["id", "displayName", "emails", "photos"],
-}, async (accessToken, refreshToken, profile, done) => {
-  try {
-    const email = profile.emails?.[0]?.value || null;
-    const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
-    if (rows.length > 0) {
-      const result = await pool.query(`UPDATE users SET provider='facebook', provider_id=$1, username=$2, avatar=$3, updated_at=NOW() WHERE id=$4 RETURNING *`,
-        [profile.id, profile.displayName, profile.photos?.[0]?.value, rows[0].id]);
-      return done(null, result.rows[0]);
+passport.use(
+  new FacebookStrategy(
+    {
+      clientID: process.env.FACEBOOK_APP_ID,
+      clientSecret: process.env.FACEBOOK_APP_SECRET,
+      callbackURL: process.env.FACEBOOK_CALLBACK_URL,
+      profileFields: ["id", "displayName", "emails", "photos"],
+    },
+    async (accessToken, refreshToken, profile, done) => {
+      try {
+        const email = profile.emails?.[0]?.value || null;
+        const providerId = profile.id;
+        const avatar = profile.photos?.[0]?.value || null;
+        const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
+        if (rows.length > 0) {
+          const result = await pool.query(
+            `UPDATE users SET provider='facebook', provider_id=$1, username=$2, avatar=$3, updated_at=NOW() WHERE id=$4 RETURNING *`,
+            [providerId, profile.displayName || profile.username, avatar, rows[0].id]
+          );
+          return done(null, result.rows[0]);
+        }
+        const result = await pool.query(
+          `INSERT INTO users (username, email, provider, provider_id, avatar, created_at, updated_at) VALUES ($1,$2,'facebook',$3,$4,NOW(),NOW()) RETURNING *`,
+          [profile.displayName || profile.username || email, email, providerId, avatar]
+        );
+        done(null, result.rows[0]);
+      } catch (err) { done(err, null); }
     }
-    const result = await pool.query(`INSERT INTO users (username, email, provider, provider_id, avatar, created_at, updated_at) VALUES ($1,$2,'facebook',$3,$4,NOW(),NOW()) RETURNING *`,
-      [profile.displayName, email, profile.id, profile.photos?.[0]?.value]);
-    done(null, result.rows[0]);
-  } catch (err) { done(err, null); }
-}));
+  )
+);
 
 function signJwtForUser(user) {
   return jwt.sign({ id: user.id, email: user.email, provider: user.provider }, JWT_SECRET, { expiresIn: "14d" });
@@ -1042,13 +636,10 @@ async function requireAuth(req, res, next) {
   } catch (err) { return res.status(401).json({ error: "Invalid token" }); }
 }
 
-// ============================================================
-// 🏠 ROOT ROUTE
-// ============================================================
-
+// ================== ROOT ROUTE ==================
 app.get("/", (req, res) => {
   res.status(200).send(`
-    <h1>🚀 Omevo Backend (Mediasoup) is Running</h1>
+    <h1>🚀 Omevo Backend is Running</h1>
     <p>Status: <strong>Online</strong></p>
     <p>Time: ${new Date().toISOString()}</p>
     <hr>
@@ -1056,35 +647,54 @@ app.get("/", (req, res) => {
     <ul>
       <li>Database: ✅ Connected</li>
       <li>Redis: ${redisClient ? "✅ Connected" : "⚠️ Not Configured"}</li>
-      <li>Mediasoup Workers: ${mediasoupWorkers.length}</li>
-      <li>Active Rooms: ${rooms.size}</li>
-      <li>Announced IP: ${process.env.MEDIASOUP_ANNOUNCED_IP || "Auto-detect"}</li>
-      <li>Stripe: ${stripe ? "✅" : "⚠️"}</li>
-      <li>Coinbase: ${ChargeResource ? "✅" : "⚠️"}</li>
+      <li>Matchmaking: ${useRedisForMatching ? "🚀 Redis-powered" : "⚡ In-memory mode"}</li>
+      <li>Stripe: ${stripe ? "✅ Configured" : "⚠️ Not Configured"}</li>
+      <li>Coinbase: ${ChargeResource ? "✅ Configured" : "⚠️ Not Configured"}</li>
     </ul>
     <p><a href="/auth/google">Login with Google</a></p>
   `);
 });
 
-// ============================================================
-// 🔐 OAUTH ROUTES
-// ============================================================
-
+// ------------------- OAUTH ROUTES -------------------
 app.get("/auth/google", authLimiter, passport.authenticate("google", { scope: ["profile", "email"] }));
-app.get("/auth/google/callback", authLimiter, passport.authenticate("google", { failureRedirect: "/auth/failure", session: true }),
-  (req, res) => res.redirect(`${process.env.FRONTEND_URL}/auth/callback?token=${signJwtForUser(req.user)}`));
+app.get(
+  "/auth/google/callback",
+  authLimiter,
+  passport.authenticate("google", { failureRedirect: "/auth/failure", session: true }),
+  (req, res) => {
+    const token = signJwtForUser(req.user);
+    res.redirect(`${process.env.FRONTEND_URL}/auth/callback?token=${token}`);
+  }
+);
 
 app.get("/auth/discord", authLimiter, passport.authenticate("discord"));
-app.get("/auth/discord/callback", authLimiter, passport.authenticate("discord", { failureRedirect: "/auth/failure", session: true }),
-  (req, res) => res.redirect(`${process.env.FRONTEND_URL}/auth/callback?token=${signJwtForUser(req.user)}`));
+app.get(
+  "/auth/discord/callback",
+  authLimiter,
+  passport.authenticate("discord", { failureRedirect: "/auth/failure", session: true }),
+  (req, res) => {
+    const token = signJwtForUser(req.user);
+    res.redirect(`${process.env.FRONTEND_URL}/auth/callback?token=${token}`);
+  }
+);
 
 app.get("/auth/facebook", authLimiter, passport.authenticate("facebook", { scope: ["email"] }));
-app.get("/auth/callback/facebook", authLimiter, passport.authenticate("facebook", { failureRedirect: "/auth/failure", session: true }),
-  (req, res) => res.redirect(`${process.env.FRONTEND_URL}/auth/callback?token=${signJwtForUser(req.user)}`));
+app.get(
+  "/auth/callback/facebook",
+  authLimiter,
+  passport.authenticate("facebook", { failureRedirect: "/auth/failure", session: true }),
+  (req, res) => {
+    const token = signJwtForUser(req.user);
+    res.redirect(`${process.env.FRONTEND_URL}/auth/callback?token=${token}`);
+  }
+);
 
 app.get("/auth/me", requireAuth, async (req, res) => {
   try {
-    const { rows } = await pool.query(`SELECT *, GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (NOW() - created_at)) / 3600)) as level FROM users WHERE id=$1`, [req.user.id]);
+    const { rows } = await pool.query(
+      `SELECT *, GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (NOW() - created_at)) / 3600)) as level FROM users WHERE id=$1`,
+      [req.user.id]
+    );
     let user = rows[0];
     if (!user.location || user.location === 'any') {
       const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress;
@@ -1094,33 +704,17 @@ app.get("/auth/me", requireAuth, async (req, res) => {
       user.location = loc;
     }
     userCache.set(`user:${req.user.id}`, user);
-    res.json({ authenticated: true, user });
+    res.json({ authenticated: true, user: user });
   } catch (err) { res.status(500).json({ error: "Auth check failed" }); }
 });
 
-app.get("/auth/failure", (req, res) => res.status(401).json({ error: "Authentication failed", details: req.query.error }));
-
-// ============================================================
-// 🎬 MEDIASOUP ROUTER CAPABILITIES ENDPOINT
-// ============================================================
-
-app.get("/api/mediasoup/router-rtp-capabilities", requireAuth, async (req, res) => {
-  try {
-    const worker = mediasoupWorkers[0];
-    const router = await worker.createRouter({ mediaCodecs: MEDIASOUP_CONFIG.router.mediaCodecs });
-    const rtpCapabilities = router.rtpCapabilities;
-    await router.close();
-    res.json({ rtpCapabilities });
-  } catch (err) {
-    console.error("Error getting RTP capabilities:", err);
-    res.status(500).json({ error: "Failed to get router capabilities" });
-  }
+app.get("/auth/failure", (req, res) => {
+  const errorMsg = req.query.error || "Unknown error";
+  console.error(`OAuth Failure: ${errorMsg}`);
+  res.status(401).json({ error: "Authentication failed", details: errorMsg });
 });
 
-// ============================================================
-// 🎬 SOCKET.IO MIDDLEWARE
-// ============================================================
-
+// ------------------- SOCKET.IO MIDDLEWARE -------------------
 io.use(async (socket, next) => {
   try {
     const token = socket.handshake.auth.token || socket.handshake.query.token;
@@ -1143,8 +737,6 @@ io.use(async (socket, next) => {
     socket.data.user = user;
     socket.data.lastFrameModeration = 0;
     socket.data.inQueue = false;
-    socket.data.currentRoom = null;
-    socket.data.mediasoupPeer = null;
     next();
   } catch (err) {
     console.error("Socket auth middleware rejected:", err.message);
@@ -1152,16 +744,13 @@ io.use(async (socket, next) => {
   }
 });
 
-// ============================================================
-// 🎬 SOCKET.IO HANDLERS
-// ============================================================
-
+// ------------------- SOCKET.IO HANDLERS -------------------
 async function detectSuspiciousBehavior(userId, action, metadata = {}) {
   try {
     await pool.query("INSERT INTO user_activity (user_id, action, metadata, created_at) VALUES ($1, $2, $3, NOW())", [userId, action, JSON.stringify(metadata)]);
     const { rows } = await pool.query(`SELECT COUNT(*) as count FROM user_activity WHERE user_id=$1 AND action=$2 AND created_at > NOW() - INTERVAL '1 hour'`, [userId, action]);
     if (parseInt(rows[0].count) > 50) {
-      await pool.query("INSERT INTO flagged_users (user_id, reason, created_at) VALUES ($1, $2, NOW())", [userId, `Suspicious: ${action} ${rows[0].count}x/hour`]);
+      await pool.query("INSERT INTO flagged_users (user_id, reason, created_at) VALUES ($1, $2, NOW())", [userId, `Suspicious activity: ${action} performed ${rows[0].count} times in an hour`]);
     }
   } catch (err) { console.error("Error detecting suspicious behavior:", err); }
 }
@@ -1172,444 +761,896 @@ io.on("connection", (socket) => {
 
   console.log(`✅ User ${user.username} connected: ${socket.id}`);
   setUserOnline(String(userId), socket.id);
-  socket.emit("authenticated", { userId });
+  socket.emit("authenticated", { userId: userId });
 
-  // ==================== MEDIASOUP HANDLERS ====================
-
-  socket.on("mediasoup-join-room", async ({ roomId }, callback) => {
-    if (!userId) return callback?.({ error: "Not authenticated" });
-
-    const queue = getPeerQueue(socket.id);
-    await queue.push(async () => {
-      try {
-        const room = await createRoom(roomId);
-        if (room.getPeer(socket.id)) return callback?.({ error: "Already in this room" });
-
-        const peer = new MediaSoupPeer({ id: socket.id, socket, room, user });
-        room.addPeer(peer);
-        socket.data.currentRoom = roomId;
-        socket.data.mediasoupPeer = peer;
-
-        callback?.({ rtpCapabilities: room.router.rtpCapabilities, peerId: socket.id });
-        await broadcastNewPeer(room, peer);
-
-        const existingPeers = room.getPeers().filter(p => p.id !== socket.id && !p.closed);
-        socket.emit("existing-peers", { peers: existingPeers.map(p => p.getJson()) });
-
-        console.log(`🎬 Peer ${user.username} joined room ${roomId}`);
-      } catch (err) {
-        console.error("Join room error:", err);
-        callback?.({ error: err.message });
-      }
-    });
-  });
-
-  socket.on("mediasoup-create-send-transport", async ({ roomId }, callback) => {
-    const queue = getPeerQueue(socket.id);
-    await queue.push(async () => {
-      try {
-        const room = rooms.get(roomId);
-        if (!room) return callback?.({ error: "Room not found" });
-        const peer = room.getPeer(socket.id);
-        if (!peer) return callback?.({ error: "Not in room" });
-
-        const { transport, params } = await createWebRtcTransport(room.router, socket);
-        peer.sendTransport = transport;
-
-        transport.on("connect", ({ dtlsParameters }, connectCallback) => {
-          transport.connect({ dtlsParameters }).then(() => connectCallback()).catch(connectCallback);
-        });
-
-        transport.on("produce", async ({ kind, rtpParameters, appData }, produceCallback) => {
-          try {
-            const producer = await createProducer(peer, { kind, rtpParameters, appData });
-            produceCallback({ id: producer.id });
-            for (const otherPeer of room.getPeers()) {
-              if (otherPeer.id !== peer.id && !otherPeer.closed) {
-                otherPeer.socket.emit("new-producer", { producerId: producer.id, peerId: peer.id, kind, appData: producer.appData });
-              }
-            }
-          } catch (err) { produceCallback({ error: err.message }); }
-        });
-
-        transport.on("producedata", async ({ sctpStreamParameters, label, protocol, appData }, produceCallback) => {
-          try {
-            const dataProducer = await createDataProducer(peer, { sctpStreamParameters, label, protocol, appData });
-            produceCallback({ id: dataProducer.id });
-            for (const otherPeer of room.getPeers()) {
-              if (otherPeer.id !== peer.id && !otherPeer.closed) {
-                otherPeer.socket.emit("new-data-producer", { dataProducerId: dataProducer.id, peerId: peer.id, label, protocol });
-              }
-            }
-          } catch (err) { produceCallback({ error: err.message }); }
-        });
-
-        callback?.(params);
-      } catch (err) {
-        console.error("Create send transport error:", err);
-        callback?.({ error: err.message });
-      }
-    });
-  });
-
-  socket.on("mediasoup-create-recv-transport", async ({ roomId }, callback) => {
-    const queue = getPeerQueue(socket.id);
-    await queue.push(async () => {
-      try {
-        const room = rooms.get(roomId);
-        if (!room) return callback?.({ error: "Room not found" });
-        const peer = room.getPeer(socket.id);
-        if (!peer) return callback?.({ error: "Not in room" });
-
-        const { transport, params } = await createWebRtcTransport(room.router, socket);
-        peer.recvTransport = transport;
-
-        transport.on("connect", ({ dtlsParameters }, connectCallback) => {
-          transport.connect({ dtlsParameters }).then(() => connectCallback()).catch(connectCallback);
-        });
-
-        callback?.(params);
-      } catch (err) {
-        console.error("Create recv transport error:", err);
-        callback?.({ error: err.message });
-      }
-    });
-  });
-
-  socket.on("mediasoup-connect-send-transport", async ({ dtlsParameters }, callback) => {
+  socket.on("join_queue", async (data = {}) => {
+    if (!userId) return socket.emit("error", { message: "Not authenticated" });
+    
     try {
-      const peer = socket.data.mediasoupPeer;
-      if (!peer?.sendTransport) return callback?.({ error: "No send transport" });
-      await peer.sendTransport.connect({ dtlsParameters });
-      callback?.();
-    } catch (err) {
-      console.error("Connect send transport error:", err);
-      callback?.({ error: err.message });
-    }
-  });
-
-  socket.on("mediasoup-connect-recv-transport", async ({ dtlsParameters }, callback) => {
-    try {
-      const peer = socket.data.mediasoupPeer;
-      if (!peer?.recvTransport) return callback?.({ error: "No recv transport" });
-      await peer.recvTransport.connect({ dtlsParameters });
-      callback?.();
-    } catch (err) {
-      console.error("Connect recv transport error:", err);
-      callback?.({ error: err.message });
-    }
-  });
-
-  socket.on("mediasoup-produce", async ({ kind, rtpParameters, appData }, callback) => {
-    const queue = getPeerQueue(socket.id);
-    await queue.push(async () => {
-      try {
-        const peer = socket.data.mediasoupPeer;
-        if (!peer?.sendTransport) return callback?.({ error: "No send transport" });
-
-        const producer = await createProducer(peer, { kind, rtpParameters, appData });
-        callback?.({ id: producer.id });
-
-        for (const otherPeer of peer.room.getPeers()) {
-          if (otherPeer.id !== peer.id && !otherPeer.closed) {
-            otherPeer.socket.emit("new-producer", { producerId: producer.id, peerId: peer.id, kind, appData: producer.appData });
-          }
-        }
-      } catch (err) {
-        console.error("Produce error:", err);
-        callback?.({ error: err.message });
-      }
-    });
-  });
-
-  socket.on("mediasoup-consume", async ({ producerId, rtpCapabilities }, callback) => {
-    const queue = getPeerQueue(socket.id);
-    await queue.push(async () => {
-      try {
-        const peer = socket.data.mediasoupPeer;
-        if (!peer?.recvTransport) return callback?.({ error: "No recv transport" });
-
-        const room = peer.room;
-        let producer = null;
-        
-        for (const p of room.getPeers()) {
-          const found = p.producers.get(producerId);
-          if (found) { producer = found; break; }
-        }
-
-        if (!producer) return callback?.({ error: "Producer not found" });
-
-        const { consumer, params } = await consume({ peer, producer, rtpCapabilities });
-        callback?.(params);
-      } catch (err) {
-        console.error("Consume error:", err);
-        callback?.({ error: err.message });
-      }
-    });
-  });
-
-  socket.on("mediasoup-resume-consumer", async ({ consumerId }, callback) => {
-    try {
-      const peer = socket.data.mediasoupPeer;
-      const consumer = peer?.consumers.get(consumerId);
-      if (!consumer) return callback?.({ error: "Consumer not found" });
-      await consumer.resume();
-      callback?.();
-    } catch (err) {
-      console.error("Resume consumer error:", err);
-      callback?.({ error: err.message });
-    }
-  });
-
-  socket.on("mediasoup-pause-producer", async ({ producerId }, callback) => {
-    try {
-      const peer = socket.data.mediasoupPeer;
-      const producer = peer?.producers.get(producerId);
-      if (!producer) return callback?.({ error: "Producer not found" });
-      await producer.pause();
-      callback?.();
-    } catch (err) { callback?.({ error: err.message }); }
-  });
-
-  socket.on("mediasoup-resume-producer", async ({ producerId }, callback) => {
-    try {
-      const peer = socket.data.mediasoupPeer;
-      const producer = peer?.producers.get(producerId);
-      if (!producer) return callback?.({ error: "Producer not found" });
-      await producer.resume();
-      callback?.();
-    } catch (err) { callback?.({ error: err.message }); }
-  });
-
-  socket.on("mediasoup-close-producer", async ({ producerId }, callback) => {
-    try {
-      const peer = socket.data.mediasoupPeer;
-      const producer = peer?.producers.get(producerId);
-      if (!producer) return callback?.({ error: "Producer not found" });
-      await producer.close();
-      peer.producers.delete(producerId);
-
-      for (const otherPeer of peer.room.getPeers()) {
-        if (otherPeer.id !== peer.id && !otherPeer.closed) {
-          otherPeer.socket.emit("producer-closed", { producerId, peerId: peer.id });
-        }
-      }
-      callback?.();
-    } catch (err) { callback?.({ error: err.message }); }
-  });
-
-  socket.on("mediasoup-close-consumer", async ({ consumerId }, callback) => {
-    try {
-      const peer = socket.data.mediasoupPeer;
-      const consumer = peer?.consumers.get(consumerId);
-      if (!consumer) return callback?.({ error: "Consumer not found" });
-      await consumer.close();
-      peer.consumers.delete(consumerId);
-      callback?.();
-    } catch (err) { callback?.({ error: err.message }); }
-  });
-
-  socket.on("mediasoup-restart-ice", async ({ transportId }, callback) => {
-    try {
-      const peer = socket.data.mediasoupPeer;
-      let transport = peer?.sendTransport?.id === transportId ? peer.sendTransport
-                    : peer?.recvTransport?.id === transportId ? peer.recvTransport
-                    : null;
-      
-      if (!transport) return callback?.({ error: "Transport not found" });
-      
-      const iceParameters = await transport.restartIce();
-      callback?.({ iceParameters });
-    } catch (err) {
-      console.error("Restart ICE error:", err);
-      callback?.({ error: err.message });
-    }
-  });
-
-  // ==================== MATCHMAKING & ROOM LOGIC ====================
-
-  socket.on("join-queue", async (data, callback) => {
-    try {
-      if (socket.data.inQueue) return callback?.({ error: "Already in queue" });
-      if (socket.data.currentRoom) return callback?.({ error: "Already in a room, leave first" });
-
-      const { rows } = await pool.query(
-        "SELECT gender, looking_for, location, interests, nickname, username, avatar FROM users WHERE id = $1",
+      const { rows: activeMatch } = await pool.query(
+        "SELECT * FROM matches WHERE (user_a=$1 OR user_b=$1) AND ended_at IS NULL",
         [userId]
       );
+      if (activeMatch.length > 0) {
+        return socket.emit("error", { message: "You're already in a match" });
+      }
 
-      if (!rows.length) return callback?.({ error: "User not found" });
+      if (user.banned_until && new Date(user.banned_until) > new Date()) {
+        return socket.emit("error", { message: "Account is banned" });
+      }
 
-      const userData = rows[0];
+      if (!user.age_verified) {
+        return socket.emit("error", { message: "Age verification required for video features" });
+      }
+
+      const nickname = data.nickname || user.nickname || "";
+      if (nickname && (nickname.length > MAX_NICKNAME_LENGTH || nickname.length < 1)) {
+        return socket.emit("error", { message: `Nickname must be between 1 and ${MAX_NICKNAME_LENGTH} characters` });
+      }
+
+      let interests = data.interests || user.interests || [];
+      if (!Array.isArray(interests) || interests.length > MAX_INTERESTS) {
+        return socket.emit("error", { message: `You can have up to ${MAX_INTERESTS} interests` });
+      }
+      interests = interests.filter(i => typeof i === "string" && i.length > 0 && i.length <= 30);
+
+      let location = data.location || user.location || "any";
+      if (!location || location === "any") {
+        const ip = socket.handshake.headers["x-forwarded-for"]?.split(",")[0] || socket.handshake.address;
+        const geo = geoip.lookup(ip);
+        location = geo?.country?.toLowerCase() || "any";
+      }
+
       const queueEntry = {
-        userId,
+        userId: String(userId),
         socketId: socket.id,
-        gender: userData.gender || "any",
-        looking_for: userData.looking_for || "any",
-        location: userData.location || "any",
-        interests: userData.interests || [],
-        nickname: userData.nickname || "",
-        username: userData.username || "",
-        avatar: userData.avatar || "",
+        gender: data.gender || user.gender || "any",
+        looking_for: data.looking_for || user.looking_for || "any",
+        location,
+        interests,
+        nickname,
+        username: user.username || "User",
+        avatar: user.avatar || "",
         ts: Date.now(),
       };
 
+      if (useRedisForMatching) {
+        await redisQueueAdd(queueEntry);
+      }
       localMatchQueue.set(String(userId), queueEntry);
-      if (useRedisForMatching) await redisQueueAdd(queueEntry);
-      
       socket.data.inQueue = true;
+
+      await pool.query(
+        `INSERT INTO queue (user_id, gender, looking_for, location, interests, nickname, joined_at) 
+         VALUES ($1,$2,$3,$4,$5,$6,NOW()) 
+         ON CONFLICT (user_id) DO UPDATE SET gender=EXCLUDED.gender, looking_for=EXCLUDED.looking_for, 
+         location=EXCLUDED.location, interests=EXCLUDED.interests, nickname=EXCLUDED.nickname, joined_at=NOW()`,
+        [queueEntry.userId, queueEntry.gender, queueEntry.looking_for, queueEntry.location, queueEntry.interests, queueEntry.nickname]
+      );
+
+      await pool.query(
+        `UPDATE users SET gender=$1, looking_for=$2, location=$3, interests=$4, nickname=$5, updated_at=NOW() WHERE id=$6`,
+        [queueEntry.gender, queueEntry.looking_for, queueEntry.location, queueEntry.interests, queueEntry.nickname, userId]
+      );
+
+      const queueCount = await getQueueCount();
+      socket.emit("queue_joined", { 
+        position: queueCount, 
+        locationUsed: location,
+        estimatedWait: queueCount > 1 ? "Searching..." : "Waiting for others..."
+      });
+
+      console.log(`📋 User ${user.username} joined queue (position: ${queueCount})`);
 
       const match = await tryMatchForUser(userId);
       
       if (match) {
-        socket.data.inQueue = false;
-        callback?.({ status: "matched", ...match });
+        console.log(`⚡ Instant match for ${user.username}`);
       } else {
-        callback?.({ status: "searching" });
+        socket.emit("queue_waiting", { 
+          position: await getQueueCount(),
+          message: "Looking for someone to chat with..." 
+        });
       }
+
     } catch (err) {
       console.error("Join queue error:", err);
-      callback?.({ error: err.message });
+      socket.emit("error", { message: "Failed to join queue" });
     }
   });
 
-  socket.on("leave-queue", async (callback) => {
+  socket.on("leave_queue", async () => {
+    if (!userId) return;
     try {
       await removeFromQueue(userId);
       socket.data.inQueue = false;
-      callback?.({ success: true });
+      socket.emit("queue_left", { message: "Left the queue" });
+      console.log(`📋 User ${user.username} left queue`);
     } catch (err) {
-      callback?.({ error: err.message });
+      console.error("Leave queue error:", err);
     }
   });
 
-  socket.on("skip-user", async ({ reason }, callback) => {
+  socket.on("queue_status", async () => {
+    if (!userId) return;
     try {
-      const currentRoomId = socket.data.currentRoom;
-      
-      if (currentRoomId) {
-        const room = rooms.get(currentRoomId);
-        if (room) {
-          for (const otherPeer of room.getPeers()) {
-            if (otherPeer.id !== socket.id && !otherPeer.closed) {
-              otherPeer.socket.emit("peer-skipped", { peerId: socket.id, reason });
-            }
-          }
-        }
-        await leaveCurrentRoom();
-      }
-
-      // Re-join queue automatically for OmeTV style
-      socket.emit("join-queue", {}, (response) => {
-        if (callback) callback(response);
+      const queueCount = await getQueueCount();
+      socket.emit("queue_status", { 
+        inQueue: socket.data.inQueue || localMatchQueue.has(String(userId)),
+        position: queueCount 
       });
-
     } catch (err) {
-      console.error("Skip user error:", err);
-      callback?.({ error: err.message });
+      console.error("Queue status error:", err);
     }
   });
 
-  socket.on("send-room-message", async ({ text }, callback) => {
-    try {
-      if (!text || !socket.data.currentRoom) return;
-      
-      const room = rooms.get(socket.data.currentRoom);
-      if (!room) return;
-
-      const messageData = {
-        id: Date.now().toString(),
-        peerId: socket.id,
-        userId: userId,
-        username: user.username,
-        text: text.substring(0, 500),
-        timestamp: Date.now(),
-      };
-
-      for (const otherPeer of room.getPeers()) {
-        if (otherPeer.id !== socket.id && !otherPeer.closed) {
-          otherPeer.socket.emit("new-room-message", messageData);
-        }
-      }
-      
-      callback?.({ success: true });
-    } catch (err) {
-      callback?.({ error: err.message });
-    }
+  socket.on("typing", ({ room }) => {
+    if (!room || !isInRoom(socket, room)) return;
+    socket.to(room).emit("typing", { uid: userId });
   });
-
-  socket.on("report-peer", async ({ reportedUserId, reason }, callback) => {
-    try {
-      await detectSuspiciousBehavior(reportedUserId, "reported", { reportedBy: userId, reason });
-      await pool.query(
-        "INSERT INTO reports (reporter_id, reported_id, reason, created_at) VALUES ($1, $2, $3, NOW())",
-        [userId, reportedUserId, reason]
-      );
-      callback?.({ success: true, message: "User reported" });
-    } catch (err) {
-      callback?.({ error: err.message });
-    }
-  });
-
-  // ==================== INTERNAL HELPERS ====================
-
-  async function leaveCurrentRoom() {
-    const peer = socket.data.mediasoupPeer;
-    if (peer && !peer.closed) {
-      await closePeerAndNotify(peer);
-    }
-    
-    if (socket.data.currentRoom) {
-      const room = rooms.get(socket.data.currentRoom);
-      if (room && room.getPeers().length === 0) {
-        await closeRoom(socket.data.currentRoom);
-      }
-    }
-    
-    socket.data.currentRoom = null;
-    socket.data.mediasoupPeer = null;
-  }
-
-  // ==================== DISCONNECT HANDLER ====================
 
   socket.on("disconnect", async (reason) => {
-    console.log(`❌ User ${user.username} disconnected: ${reason}`);
+    console.log(`❌ User ${user.username} disconnected: ${socket.id} (${reason})`);
 
-    if (socket.data.inQueue) {
+    try {
+      await setUserOffline(String(userId));
+      await pool.query(
+        `UPDATE matches SET ended_at = NOW() WHERE (user_a = $1 OR user_b = $1) AND ended_at IS NULL`,
+        [userId]
+      );
       await removeFromQueue(userId);
-    }
+      socket.data.inQueue = false;
 
-    if (socket.data.currentRoom) {
-      await leaveCurrentRoom();
-    }
+      const rooms = getSocketRooms(socket);
+      for (const room of rooms) {
+        socket.to(room).emit("peer_left", {
+          socketId: socket.id,
+          userId: userId,
+        });
+      }
 
-    await setUserOffline(userId);
-    removePeerQueue(socket.id);
+      await pool.query("DELETE FROM queue WHERE user_id=$1", [String(userId)]).catch(() => {});
+    } catch (err) {
+      console.error("Disconnect cleanup error:", err);
+    }
+  });
+
+  socket.on("message", async ({ room, text }) => {
+    if (!userId) return socket.emit("error", { message: "Not authenticated" });
+    try {
+      const userRooms = getSocketRooms(socket);
+      let targetRoom = room;
+      if (targetRoom) {
+        if (!isInRoom(socket, targetRoom)) return socket.emit("error", { message: "You're not in this room" });
+      } else if (userRooms.length > 0) {
+        targetRoom = userRooms[0];
+      } else {
+        return socket.emit("error", { message: "You're not in any room" });
+      }
+
+      if (!text || text.length > 500) return socket.emit("error", { message: "Message too long" });
+
+      await detectSuspiciousBehavior(userId, "chat_message", { length: text.length });
+
+      if (IS_MODERATION_ENABLED) {
+        const mod = await OPENAI.moderations.create({ model: "omni-moderation-latest", input: text });
+        const flagged = mod.results?.[0]?.categories?.sexual || mod.results?.[0]?.categories?.hate || mod.results?.[0]?.categories?.violence || mod.results?.[0]?.flagged;
+
+        if (flagged) {
+          const banReason = `Inappropriate message: ${JSON.stringify(mod.results[0].category_scores)}`;
+          await pool.query("UPDATE users SET banned_until = NOW() + INTERVAL '750 hours', ban_reason=$1 WHERE id=$2", [banReason, userId]);
+          socket.emit("moderation_action", { type: "chat", text, banned: true, duration_hours: BAN_HOURS, reason: banReason });
+          await pool.query("INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())", [userId, "auto_ban", banReason]);
+          userCache.del(`user:${userId}`);
+          socket.disconnect(true);
+          return;
+        }
+      } else {
+        console.warn("OpenAI moderation skipped for chat: Invalid API key.");
+      }
+
+      const { rows } = await pool.query("INSERT INTO chat_messages (user_id, room_id, message, created_at) VALUES ($1, $2, $3, NOW()) RETURNING *", [userId, targetRoom, text]);
+      const messageData = { id: rows[0].id, uid: userId, text, timestamp: rows[0].created_at, username: user?.username || "User" };
+      
+      socket.to(targetRoom).emit("message", messageData);
+      socket.emit("message", messageData);
+    } catch (err) {
+      console.error("Chat message error:", err);
+      socket.emit("error", { message: "Failed to send message" });
+    }
+  });
+
+  socket.on("name-update", async ({ room, name }) => {
+    if (!userId) return;
+    try {
+      const userRooms = getSocketRooms(socket);
+      let targetRoom = room;
+      if (targetRoom) {
+        if (!isInRoom(socket, targetRoom)) return;
+      } else if (userRooms.length > 0) {
+        targetRoom = userRooms[0];
+      } else { return; }
+
+      await pool.query("UPDATE users SET username=$1, updated_at=NOW() WHERE id=$2", [name, userId]);
+      const updatedUser = { ...user, username: name };
+      userCache.set(`user:${userId}`, updatedUser);
+      socket.data.user = updatedUser;
+      io.to(targetRoom).emit("name-update", { name, uid: userId });
+    } catch (err) { console.error("Name update error:", err); }
+  });
+
+  socket.on("video_frame", async ({ frameBase64, roomId }) => {
+    if (!userId) return;
+    const now = Date.now();
+    if (now - socket.data.lastFrameModeration < 1000) return;
+    socket.data.lastFrameModeration = now;
+
+    try {
+      const userRooms = getSocketRooms(socket);
+      let targetRoom = roomId;
+      if (targetRoom) {
+        if (!isInRoom(socket, targetRoom)) return;
+      } else if (userRooms.length > 0) {
+        targetRoom = userRooms[0];
+      } else { return; }
+
+      await detectSuspiciousBehavior(userId, "video_frame");
+      const buffer = Buffer.from(frameBase64.split(",")[1], "base64");
+      const processedImage = await sharp(buffer).resize({ width: 320, height: 240, fit: "inside" }).jpeg({ quality: 70 }).toBuffer();
+      const processedBase64 = `data:image/jpeg;base64,${processedImage.toString("base64")}`;
+
+      if (IS_MODERATION_ENABLED) {
+        const mod = await OPENAI.moderations.create({ model: "omni-moderation-latest", input: processedBase64 });
+        const result = mod.results?.[0];
+        const flagged = result?.flagged || result?.categories?.sexual || result?.categories?.violence || result?.categories?.hate;
+
+        if (flagged) {
+          const banReason = `Inappropriate content detected`;
+          await pool.query("UPDATE users SET banned_until = NOW() + INTERVAL '750 hours', ban_reason=$1 WHERE id=$2", [banReason, userId]);
+          await pool.query("INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())", [userId, "auto_ban", banReason]);
+          userCache.del(`user:${userId}`);
+          socket.emit("moderation_action", { type: "video", banned: true, duration_hours: BAN_HOURS, reason: banReason, offendingFrame: processedBase64 });
+          socket.disconnect(true);
+          return;
+        }
+      }
+
+      const roomSockets = await io.in(targetRoom).fetchSockets();
+      for (const s of roomSockets) {
+        if (String(s.data.userId) !== String(userId)) {
+          io.to(s.id).emit("video_frame", { frameBase64: processedBase64, from: userId });
+        }
+      }
+    } catch (err) { console.error("Video moderation error:", err); }
+  });
+
+  socket.on("join_room", async ({ room }) => {
+    if (!room || !userId) return;
+    try {
+      const currentRooms = getSocketRooms(socket);
+      for (const r of currentRooms) {
+        socket.leave(r);
+        socket.to(r).emit("peer_left", { socketId: socket.id, userId: userId });
+      }
+      socket.join(room);
+      socket.to(room).emit("peer_joined", { socketId: socket.id, userId: userId, username: user?.username || "User" });
+      const { rows } = await pool.query("SELECT * FROM chat_messages WHERE room_id=$1 ORDER BY created_at DESC LIMIT 50", [room]);
+      socket.emit("room_history", { messages: rows.reverse().map((msg) => ({ id: msg.id, uid: msg.user_id, message: msg.message, timestamp: msg.created_at })) });
+      await pool.query("INSERT INTO room_activity (user_id, room_id, action, created_at) VALUES ($1, $2, $3, NOW())", [userId, room, "join"]);
+    } catch (err) { console.error("Error joining room:", err); socket.emit("error", { message: "Failed to join room" }); }
+  });
+
+  socket.on("leave_room", async ({ room }) => {
+    if (!room || !userId || !isInRoom(socket, room)) return;
+    try {
+      socket.leave(room);
+      socket.to(room).emit("peer_left", { socketId: socket.id, userId: userId });
+      await pool.query("INSERT INTO room_activity (user_id, room_id, action, created_at) VALUES ($1, $2, $3, NOW())", [userId, room, "leave"]);
+    } catch (err) { console.error("Error leaving room:", err); socket.emit("error", { message: "Failed to leave room" }); }
+  });
+
+  socket.on("report_user", async ({ reportedUserId, reason, roomId }) => {
+    if (!userId) return;
+    try {
+      if (!reason || reason.length < 10 || reason.length > 200) return socket.emit("error", { message: "Invalid report reason" });
+      if (roomId && !isInRoom(socket, roomId)) return socket.emit("error", { message: "You can only report users in the same room" });
+
+      const { rows } = await pool.query(`SELECT COUNT(*) as count FROM user_reports WHERE reporter_id=$1 AND reported_id=$2 AND created_at > NOW() - INTERVAL '24 hours'`, [userId, reportedUserId]);
+      if (parseInt(rows[0].count) > 0) return socket.emit("error", { message: "You already reported this user recently" });
+
+      await pool.query("INSERT INTO user_reports (reporter_id, reported_id, reason, room_id, created_at) VALUES ($1, $2, $3, $4, NOW())", [userId, reportedUserId, reason, roomId]);
+      
+      const { rows: reportCount } = await pool.query(`SELECT COUNT(*) as count FROM user_reports WHERE reported_id=$1 AND created_at > NOW() - INTERVAL '24 hours'`, [reportedUserId]);
+      if (parseInt(reportCount[0].count) >= 3) {
+        await pool.query("UPDATE users SET banned_until = NOW() + INTERVAL '168 hours', ban_reason=$1 WHERE id=$2", ["Multiple user reports", reportedUserId]);
+        userCache.del(`user:${reportedUserId}`);
+        const reportedSocketId = await getUserSocketId(String(reportedUserId));
+        if (reportedSocketId) {
+          const reportedSocket = io.sockets.sockets.get(reportedSocketId);
+          if (reportedSocket) {
+            reportedSocket.emit("banned", { reason: "Multiple user reports", until: new Date(Date.now() + 168 * 60 * 60 * 1000), canAppeal: true });
+            reportedSocket.disconnect(true);
+          }
+        }
+      }
+      socket.emit("report_submitted", { message: "Report submitted successfully" });
+    } catch (err) { console.error("Error reporting user:", err); socket.emit("error", { message: "Failed to submit report" }); }
+  });
+
+  socket.on("reaction", async ({ type, room }) => {
+    if (!userId) return;
+    let targetRoom = room;
+    if (targetRoom) { if (!isInRoom(socket, targetRoom)) return; }
+    else {
+      const rooms = getSocketRooms(socket);
+      if (rooms.length === 0) return;
+      targetRoom = rooms[0];
+    }
+    socket.to(targetRoom).emit("reaction", { type, uid: userId, username: user?.username || "User" });
+  });
+
+  socket.on("next", async () => {
+    if (!userId) return;
+    
+    try {
+      await pool.query(
+        `UPDATE matches SET ended_at = NOW() WHERE (user_a = $1 OR user_b = $1) AND ended_at IS NULL`,
+        [userId]
+      );
+
+      const rooms = getSocketRooms(socket);
+      for (const room of rooms) {
+        socket.leave(room);
+        socket.to(room).emit("peer_left", { socketId: socket.id, userId: userId });
+      }
+
+      const cachedEntry = localMatchQueue.get(String(userId));
+      const data = cachedEntry ? {
+        gender: cachedEntry.gender,
+        looking_for: cachedEntry.looking_for,
+        location: cachedEntry.location,
+        interests: cachedEntry.interests,
+        nickname: cachedEntry.nickname,
+      } : {};
+
+      socket.emit("next_ready");
+      socket.emit("auto_requeue", { preferences: data });
+      
+    } catch (err) {
+      console.error("Next error:", err);
+      socket.emit("error", { message: "Failed to find next match" });
+    }
   });
 });
 
-// ============================================================
-// 🚀 START SERVER
-// ============================================================
-
-async function startServer() {
+// ------------------- API ROUTES -------------------
+app.post("/api/create-checkout-session", requireAuth, async (req, res) => {
   try {
-    await initRedis();
-    await createMediasoupWorkers();
-
-    const PORT = process.env.PORT || 8080;
-    server.listen(PORT, () => {
-      console.log(`
-🚀 ==========================================
-🚀 Omevo Server Running on Port ${PORT}
-🚀 Env: ${process.env.NODE_ENV || "development"}
-🚀 ==========================================
-      `);
+    if (!stripe) return res.status(503).json({ error: "Payment system unavailable" });
+    const { coins, price } = req.body;
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ["card"],
+      line_items: [{ price_data: { currency: "usd", product_data: { name: `${coins} Omevo Coins`, description: `Purchase ${coins} coins for sending virtual gifts` }, unit_amount: Math.round(price * 100) }, quantity: 1 }],
+      mode: "payment",
+      success_url: `${process.env.FRONTEND_URL}?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_URL}?payment=cancelled`,
+      customer_email: req.user.email,
+      metadata: { userId: String(req.user.id), coins: coins.toString() },
     });
-  } catch (err) {
-    console.error("❌ Failed to start server:", err);
-    process.exit(1);
-  }
-}
+    res.json({ sessionId: session.id });
+  } catch (error) { console.error("Error creating checkout session:", error); res.status(500).json({ error: "Failed to create payment session" }); }
+});
 
-startServer();
+app.post("/api/verify-payment", requireAuth, async (req, res) => {
+  try {
+    if (!stripe) return res.status(503).json({ error: "Payment system unavailable" });
+    const { sessionId } = req.body;
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    if (session.payment_status === "paid") {
+      const coins = parseInt(session.metadata.coins);
+      const userId = session.metadata.userId;
+      await pool.query("UPDATE users SET coins = coins + $1, updated_at = NOW() WHERE id = $2", [coins, userId]);
+      const { rows } = await pool.query("SELECT coins FROM users WHERE id = $1", [userId]);
+      await pool.query("INSERT INTO coin_transactions (user_id, coins, amount, transaction_type, transaction_id, created_at) VALUES ($1, $2, $3, $4, $5, NOW())", [userId, coins, session.amount_total / 100, "purchase", sessionId]);
+      userCache.del(`user:${userId}`);
+      res.json({ success: true, coins: rows[0].coins });
+    } else { res.json({ success: false }); }
+  } catch (error) { console.error("Error verifying payment:", error); res.status(500).json({ error: "Failed to verify payment" }); }
+});
+
+async function ensureColumns() {
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS appeals (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), message TEXT NOT NULL, status VARCHAR(20) DEFAULT 'pending', admin_response TEXT, admin_id INTEGER, created_at TIMESTAMP DEFAULT NOW(), reviewed_at TIMESTAMP)`);
+    await pool.query(`ALTER TABLE appeals ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'pending'`);
+    await pool.query(`ALTER TABLE appeals ADD COLUMN IF NOT EXISTS admin_response TEXT`);
+    await pool.query(`ALTER TABLE appeals ADD COLUMN IF NOT EXISTS admin_id INTEGER`);
+    await pool.query(`ALTER TABLE appeals ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS coins INTEGER DEFAULT 0`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS looking_for VARCHAR(20) DEFAULT 'any'`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'user'`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS age_verified BOOLEAN DEFAULT FALSE`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_until TIMESTAMP`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason TEXT`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS nickname VARCHAR(20)`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR(20)`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS interests TEXT[] DEFAULT '{}'`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS gender VARCHAR(20) DEFAULT 'any'`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS location VARCHAR(50) DEFAULT 'any'`);
+    
+    // CRITICAL: Ensure queue table has columns for new matching logic
+    await pool.query(`ALTER TABLE queue ADD COLUMN IF NOT EXISTS looking_for VARCHAR(20) DEFAULT 'any'`);
+    await pool.query(`ALTER TABLE queue ADD COLUMN IF NOT EXISTS gender VARCHAR(20) DEFAULT 'any'`);
+    await pool.query(`ALTER TABLE queue ADD COLUMN IF NOT EXISTS location VARCHAR(50) DEFAULT 'any'`);
+    await pool.query(`ALTER TABLE queue ADD COLUMN IF NOT EXISTS interests TEXT[] DEFAULT '{}'`);
+    await pool.query(`ALTER TABLE queue ADD COLUMN IF NOT EXISTS nickname VARCHAR(20)`);
+    
+    await pool.query(`CREATE TABLE IF NOT EXISTS coin_transactions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), coins INTEGER NOT NULL, amount DECIMAL(10,2) NOT NULL, transaction_type VARCHAR(30), gift_type VARCHAR(30), recipient_id VARCHAR(50), transaction_id VARCHAR(255), created_at TIMESTAMP DEFAULT NOW())`);
+    console.log("Database columns ensured");
+  } catch (error) { console.error("Error ensuring columns:", error); }
+}
+ensureColumns();
+
+app.post("/api/user/spend-coins", requireAuth, async (req, res) => {
+  try {
+    const { coins, type, giftType, recipientId } = req.body;
+    if (!coins || coins <= 0) return res.status(400).json({ error: "Invalid coin amount" });
+    const { rows } = await pool.query("SELECT coins FROM users WHERE id = $1", [req.user.id]);
+    if (rows[0].coins < coins) return res.status(400).json({ error: "Insufficient coins" });
+    await pool.query("UPDATE users SET coins = coins - $1, updated_at = NOW() WHERE id = $2", [coins, req.user.id]);
+    await pool.query("INSERT INTO coin_transactions (user_id, coins, amount, transaction_type, gift_type, recipient_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, NOW())", [req.user.id, -coins, 0, type || "spend", giftType || null, recipientId || null]);
+    userCache.del(`user:${req.user.id}`);
+    res.json({ success: true });
+  } catch (error) { console.error("Error spending coins:", error); res.status(500).json({ error: "Failed to spend coins" }); }
+});
+
+app.post("/api/user/preferences", requireAuth, async (req, res) => {
+  try {
+    let { gender = "any", looking_for = "any", location = "any", interests = [], nickname = "" } = req.body;
+    if (nickname && (nickname.length > MAX_NICKNAME_LENGTH || nickname.length < 1)) return res.status(400).json({ error: `Nickname must be between 1 and ${MAX_NICKNAME_LENGTH} characters` });
+    if (!Array.isArray(interests) || interests.length > MAX_INTERESTS) return res.status(400).json({ error: `You can have up to ${MAX_INTERESTS} interests` });
+    interests = interests.filter((interest) => typeof interest === "string" && interest.length > 0 && interest.length <= 30);
+    const userId = String(req.user.id);
+    if (!location || location === "any") { const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress; const geo = geoip.lookup(ip); location = geo?.country?.toLowerCase() || "any"; }
+    if (req.user.banned_until && new Date(req.user.banned_until) > new Date()) return res.status(403).json({ error: "Account banned" });
+    await pool.query(`UPDATE users SET gender=$1, looking_for=$2, location=$3, interests=$4, nickname=$5, updated_at=NOW() WHERE id=$6`, [gender || "any", looking_for || "any", location || "any", interests, nickname || "", userId]);
+    const updatedUser = { ...req.user, gender, looking_for, location, interests, nickname };
+    userCache.set(`user:${userId}`, updatedUser);
+    res.json({ ok: true, locationUsed: location });
+  } catch (err) { console.error(err); res.status(500).json({ error: "Could not save preferences" }); }
+});
+
+app.post("/api/user/verify-age", requireAuth, async (req, res) => {
+  try {
+    const { age } = req.body;
+    if (!age || isNaN(age)) return res.status(400).json({ error: "Valid age required" });
+    if (age < MIN_AGE_FOR_VIDEO) return res.status(400).json({ error: `You must be at least ${MIN_AGE_FOR_VIDEO} to use video features` });
+    await pool.query("UPDATE users SET age_verified=$1, updated_at=NOW() WHERE id=$2", [true, req.user.id]);
+    const updatedUser = { ...req.user, age_verified: true };
+    userCache.set(`user:${req.user.id}`, updatedUser);
+    res.json({ ok: true });
+  } catch (err) { console.error("Age verification failed:", err); res.status(500).json({ error: "Could not verify age" }); }
+});
+
+app.post("/queue/enqueue", requireAuth, async (req, res) => {
+  console.warn("⚠️  DEPRECATED: /queue/enqueue called - use socket event 'join_queue' instead");
+  
+  try {
+    let { gender = "any", looking_for = "any", location = "any", interests = [], nickname = "" } = req.body;
+    const userId = String(req.user.id);
+    const { rows: activeMatch } = await pool.query("SELECT * FROM matches WHERE (user_a=$1 OR user_b=$1) AND ended_at IS NULL", [userId]);
+    if (activeMatch.length > 0) return res.status(400).json({ error: "You're already in a match" });
+    if (!location || location === "any") { const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress; const geo = geoip.lookup(ip); location = geo?.country?.toLowerCase() || "any"; }
+    if (req.user.banned_until && new Date(req.user.banned_until) > new Date()) return res.status(403).json({ error: "Account banned" });
+    if (!req.user.age_verified) return res.status(403).json({ error: "Age verification required for video features" });
+    if (nickname && (nickname.length > MAX_NICKNAME_LENGTH || nickname.length < 1)) return res.status(400).json({ error: `Nickname must be between 1 and ${MAX_NICKNAME_LENGTH} characters` });
+    if (!Array.isArray(interests) || interests.length > MAX_INTERESTS) return res.status(400).json({ error: `You can have up to ${MAX_INTERESTS} interests` });
+    interests = interests.filter((interest) => typeof interest === "string" && interest.length > 0 && interest.length <= 30);
+    
+    const socketId = await getUserSocketId(userId);
+    const queueEntry = {
+      userId,
+      socketId: socketId || "",
+      gender: gender || "any",
+      looking_for: looking_for || "any",
+      location: location || "any",
+      interests,
+      nickname,
+      username: req.user.username || "User",
+      avatar: req.user.avatar || "",
+      ts: Date.now(),
+    };
+    
+    localMatchQueue.set(userId, queueEntry);
+    if (useRedisForMatching) {
+      await redisQueueAdd(queueEntry);
+    }
+    
+    await pool.query(
+      `INSERT INTO queue (user_id, gender, looking_for, location, interests, nickname, joined_at) VALUES ($1,$2,$3,$4,$5,$6,NOW()) ON CONFLICT (user_id) DO UPDATE SET gender=EXCLUDED.gender, looking_for=EXCLUDED.looking_for, location=EXCLUDED.location, interests=EXCLUDED.interests, nickname=EXCLUDED.nickname, joined_at=NOW()`,
+      [userId, gender || "any", looking_for || "any", location || "any", interests, nickname]
+    );
+    
+    const match = await tryMatchForUser(userId);
+    if (match) {
+      return res.json({ matched: true, peerId: match.peerId, channel: match.channel });
+    }
+    
+    return res.json({ matched: false, locationUsed: location, deprecated: true, useSocket: true });
+  } catch (err) { console.error(err); res.status(500).json({ error: "enqueue failed" }); }
+});
+
+app.get("/queue/check", requireAuth, async (req, res) => {
+  console.warn("⚠️  DEPRECATED: /queue/check called - use socket events instead");
+  
+  try {
+    const userId = String(req.user.id);
+    const { rows } = await pool.query("SELECT * FROM matches WHERE (user_a=$1 OR user_b=$1) AND created_at > NOW() - INTERVAL '30 seconds' AND ended_at IS NULL LIMIT 1", [userId]);
+    if (rows.length > 0) {
+      const match = rows[0];
+      const peerId = match.user_a === userId ? match.user_b : match.user_a;
+      const { rows: peerRows } = await pool.query("SELECT username, nickname, avatar, gender, location, interests FROM users WHERE id=$1", [peerId]);
+      return res.json({ matched: true, peerId, channel: match.channel_name, peerInfo: peerRows[0] });
+    }
+    return res.json({ matched: false, deprecated: true, useSocket: true });
+  } catch (err) { console.error(err); res.status(500).json({ error: "queue check failed" }); }
+});
+
+app.post("/queue/leave", requireAuth, async (req, res) => {
+  console.warn("⚠️  DEPRECATED: /queue/leave called - use socket event 'leave_queue' instead");
+  
+  try { 
+    await removeFromQueue(String(req.user.id)); 
+    return res.json({ ok: true, deprecated: true, useSocket: true }); 
+  } catch (err) { console.error(err); res.status(500).json({ error: "leave failed" }); }
+});
+
+const { RtcTokenBuilder, RtcRole, RtmTokenBuilder } = agora;
+app.post("/generateToken", requireAuth, async (req, res) => {
+  try {
+    const { channelName, uid: requestedUid, role = "publisher", expirySeconds = 3600 } = req.body;
+    if (!channelName) return res.status(400).json({ error: "channelName required" });
+    const uid = requestedUid !== undefined ? String(requestedUid) : String(req.user.id);
+    const rtcRole = role === "publisher" ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER;
+    const currentTimestamp = Math.floor(Date.now() / 1000);
+    const privilegeExpiredTs = currentTimestamp + Number(expirySeconds);
+    const rtcToken = RtcTokenBuilder.buildTokenWithAccount(AGORA_APP_ID, AGORA_APP_CERTIFICATE, channelName, uid, rtcRole, privilegeExpiredTs);
+    const rtmToken = RtmTokenBuilder.buildToken(AGORA_APP_ID, AGORA_APP_CERTIFICATE, uid, privilegeExpiredTs);
+    return res.json({ rtcToken, rtmToken, appID: AGORA_APP_ID, uid });
+  } catch (err) { console.error(err); res.status(500).json({ error: "token generation failed" }); }
+});
+
+app.post("/user/display-name", requireAuth, async (req, res) => {
+  try {
+    const { display_name } = req.body;
+    if (!display_name || display_name.length > MAX_NICKNAME_LENGTH) return res.status(400).json({ error: `Display name must be between 1 and ${MAX_NICKNAME_LENGTH} characters` });
+    
+    if (IS_MODERATION_ENABLED) {
+      const mod = await OPENAI.moderations.create({ model: "omni-moderation-latest", input: display_name });
+      if (mod.results?.[0]?.flagged) return res.status(400).json({ error: "Display name contains inappropriate content" });
+    } else {
+      console.warn("OpenAI moderation skipped for name: Invalid API key.");
+    }
+
+    await pool.query("UPDATE users SET username=$1, display_name=$1, updated_at=NOW() WHERE id=$2", [display_name, req.user.id]);
+    const updatedUser = { ...req.user, username: display_name, display_name: display_name };
+    userCache.set(`user:${req.user.id}`, updatedUser);
+    res.json({ ok: true });
+  } catch (err) { console.error("Display name update failed:", err); res.status(500).json({ error: "Could not update name" }); }
+});
+
+app.get("/user/profile", requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT id, username, email, provider, avatar, gender, looking_for, location, interests, nickname, display_name, age_verified, created_at, updated_at, coins, role, GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (NOW() - created_at)) / 3600)) as level FROM users WHERE id=$1`, [req.user.id]);
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+    const user = rows[0];
+    userCache.set(`user:${user.id}`, user);
+    res.json({ ...user, display_name: user.display_name || user.username, is_admin: user.role === "admin" });
+  } catch (err) { res.status(500).json({ error: "Could not fetch profile" }); }
+});
+
+app.post("/api/user/avatar", requireAuth, async (req, res) => {
+  try {
+    const { avatarBase64 } = req.body;
+    if (!avatarBase64) return res.status(400).json({ error: "Avatar image required" });
+    const buffer = Buffer.from(avatarBase64.split(",")[1], "base64");
+    const metadata = await sharp(buffer).metadata();
+    if (metadata.width > 500 || metadata.height > 500) return res.status(400).json({ error: "Avatar must be at most 500x500 pixels" });
+    if (!["jpeg", "jpg", "png", "webp"].includes(metadata.format)) return res.status(400).json({ error: "Avatar must be in JPEG, PNG, or WebP format" });
+    
+    if (IS_MODERATION_ENABLED) {
+      const mod = await OPENAI.moderations.create({ model: "omni-moderation-latest", input: avatarBase64 });
+      if (mod.results?.[0]?.flagged) return res.status(400).json({ error: "Avatar contains inappropriate content" });
+    } else {
+      console.warn("OpenAI moderation skipped for avatar: Invalid API key.");
+    }
+
+    const processedImage = await sharp(buffer).resize({ width: 200, height: 200, fit: "cover" }).jpeg({ quality: 80 }).toBuffer();
+    const processedBase64 = `data:image/jpeg;base64,${processedImage.toString("base64")}`;
+    await pool.query("UPDATE users SET avatar=$1, updated_at=NOW() WHERE id=$2", [processedBase64, req.user.id]);
+    const updatedUser = { ...req.user, avatar: processedBase64 };
+    userCache.set(`user:${req.user.id}`, updatedUser);
+    res.json({ ok: true, avatar: processedBase64 });
+  } catch (err) { console.error("Avatar upload failed:", err); res.status(500).json({ error: "Could not upload avatar" }); }
+});
+
+app.post("/api/pay-unban", async (req, res) => {
+  try {
+    if (!ChargeResource) return res.status(503).json({ error: "Payment system unavailable" });
+    const { userId } = req.body;
+    const { rows } = await pool.query("SELECT * FROM users WHERE id=$1 AND banned_until > NOW()", [userId]);
+    if (!rows.length) return res.status(400).json({ error: "User not found or not banned" });
+    const chargeData = { name: "Ban Removal", description: "Remove your account suspension", local_price: { amount: UNBAN_PRICE.toFixed(2), currency: "USD" }, pricing_type: "fixed_price", metadata: { userId: String(userId) }, redirect_url: `${process.env.FRONTEND_URL}?unban=success`, cancel_url: `${process.env.FRONTEND_URL}` };
+    const charge = await ChargeResource.create(chargeData);
+    res.json({ url: charge.hosted_url });
+  } catch (err) { console.error(err); res.status(500).json({ error: "Coinbase payment creation failed" }); }
+});
+
+app.post("/api/create-gift-checkout", requireAuth, async (req, res) => {
+  try {
+    const { giftType, recipientId } = req.body;
+    
+    const cost = GIFT_COIN_COSTS[giftType];
+    if (!cost) {
+      return res.status(400).json({ error: "Invalid gift type" });
+    }
+
+    if (!recipientId) {
+      return res.status(400).json({ error: "Recipient ID required" });
+    }
+
+    if (req.user.coins < cost) {
+      return res.status(400).json({ 
+        error: "Insufficient coins. Please purchase more coins.", 
+        code: "INSUFFICIENT_FUNDS" 
+      });
+    }
+
+    await pool.query(
+      "UPDATE users SET coins = coins - $1, updated_at = NOW() WHERE id = $2",
+      [cost, req.user.id]
+    );
+
+    await pool.query(
+      "INSERT INTO coin_transactions (user_id, coins, amount, transaction_type, gift_type, recipient_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, NOW())",
+      [req.user.id, -cost, 0, "gift_sent", giftType, String(recipientId)]
+    );
+
+    userCache.del(`user:${req.user.id}`);
+
+    const recipientSocketId = await getUserSocketId(String(recipientId));
+    if (recipientSocketId) {
+      io.to(recipientSocketId).emit("gift_received", {
+        giftType,
+        senderId: req.user.id,
+        senderName: req.user.username || "Someone"
+      });
+    }
+
+    res.json({ success: true, newBalance: req.user.coins - cost });
+  } catch (error) {
+    console.error("Error sending gift:", error);
+    res.status(500).json({ error: "Failed to send gift" });
+  }
+});
+
+app.post("/api/coinbase-webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  const signature = req.headers["x-cc-webhook-signature"];
+  try {
+    const event = CoinbaseCommerce.Webhook.verifyEventBody(req.body.toString(), signature, process.env.COINBASE_COMMERCE_WEBHOOK_SECRET);
+    if (event.type === "charge:confirmed" || event.type === "charge:resolved") {
+      const userId = event.data.metadata?.userId;
+      if (userId) {
+        await pool.query("UPDATE users SET banned_until=NULL, ban_reason=NULL WHERE id=$1", [userId]);
+        await pool.query("INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())", [userId, "paid_unban", "User paid for unban"]);
+        console.log(`✅ User ${userId} unbanned via Coinbase payment`);
+        userCache.del(`user:${userId}`);
+      }
+    }
+    res.status(200).json({ received: true });
+  } catch (err) { console.error("Coinbase webhook error:", err); res.status(400).send(`Webhook Error: ${err.message}`); }
+});
+
+app.post("/api/moderation/appeal", requireAuth, async (req, res) => {
+  try {
+    const { message } = req.body;
+    if (!message || message.length < 10 || message.length > 500) return res.status(400).json({ error: "Appeal message must be between 10 and 500 characters" });
+    const { rows } = await pool.query("SELECT * FROM appeals WHERE user_id=$1 AND status='pending'", [req.user.id]);
+    if (rows.length > 0) return res.status(400).json({ error: "You already have a pending appeal" });
+    await pool.query("INSERT INTO appeals (user_id, message, status, created_at) VALUES ($1, $2, 'pending', NOW())", [req.user.id, message]);
+    res.json({ ok: true, message: "Appeal submitted successfully" });
+  } catch (err) { console.error("Appeal failed:", err); res.status(500).json({ error: "Could not submit appeal" }); }
+});
+
+app.get("/api/admin/appeals", requireAuth, async (req, res) => {
+  try {
+    if (req.user.role !== "admin") return res.status(403).json({ error: "Admin access required" });
+    const { rows } = await pool.query(`SELECT a.*, u.username, u.email FROM appeals a JOIN users u ON a.user_id = u.id WHERE a.status='pending' ORDER BY a.created_at DESC`);
+    res.json(rows);
+  } catch (err) { console.error("Failed to fetch appeals:", err); res.status(500).json({ error: "Could not fetch appeals" }); }
+});
+
+app.post("/api/admin/appeals/:id/respond", requireAuth, async (req, res) => {
+  try {
+    if (req.user.role !== "admin") return res.status(403).json({ error: "Admin access required" });
+    const { id } = req.params;
+    const { approved, response } = req.body;
+    if (approved === undefined) return res.status(400).json({ error: "Approval status required" });
+    const { rows } = await pool.query("SELECT * FROM appeals WHERE id=$1", [id]);
+    if (!rows.length) return res.status(404).json({ error: "Appeal not found" });
+    const appeal = rows[0];
+    await pool.query("UPDATE appeals SET status=$1, admin_response=$2, admin_id=$3, reviewed_at=NOW() WHERE id=$4", [approved ? "approved" : "rejected", response, req.user.id, id]);
+    if (approved) {
+      await pool.query("UPDATE users SET banned_until=NULL, ban_reason=NULL WHERE id=$1", [appeal.user_id]);
+      await pool.query("INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())", [appeal.user_id, "appeal_approved", "Appeal approved by admin"]);
+      userCache.del(`user:${appeal.user_id}`);
+    }
+    res.json({ ok: true });
+  } catch (err) { console.error("Failed to respond to appeal:", err); res.status(500).json({ error: "Could not respond to appeal" }); }
+});
+
+app.get("/api/admin/users", requireAuth, async (req, res) => {
+  try {
+    if (req.user.role !== "admin") return res.status(403).json({ error: "Admin access required" });
+    const { query } = req.query;
+    if (!query) return res.status(400).json({ error: "Search query required" });
+    const { rows } = await pool.query(`SELECT id, username, email, banned_until, ban_reason FROM users WHERE username ILIKE $1 OR email ILIKE $1 LIMIT 20`, [`%${query}%`]);
+    res.json({ users: rows });
+  } catch (err) { console.error("Failed to search users:", err); res.status(500).json({ error: "Could not search users" }); }
+});
+
+app.post("/api/admin/ban", requireAuth, async (req, res) => {
+  try {
+    if (req.user.role !== "admin") return res.status(403).json({ error: "Admin access required" });
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: "User ID required" });
+    const banUntil = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    await pool.query("UPDATE users SET banned_until=$1, ban_reason=$2, updated_at=NOW() WHERE id=$3", [banUntil, "Banned by admin", userId]);
+    await pool.query("INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())", [userId, "admin_ban", "Banned by admin"]);
+    userCache.del(`user:${userId}`);
+    await removeFromQueue(userId);
+    const socketId = await getUserSocketId(String(userId));
+    if (socketId) {
+      const targetSocket = io.sockets.sockets.get(socketId);
+      if (targetSocket) {
+        targetSocket.emit("banned", { reason: "Banned by admin", until: banUntil, canAppeal: true });
+        targetSocket.disconnect(true);
+      }
+    }
+    res.json({ ok: true });
+  } catch (err) { console.error("Failed to ban user:", err); res.status(500).json({ error: "Could not ban user" }); }
+});
+
+app.post("/api/admin/unban", requireAuth, async (req, res) => {
+  try {
+    if (req.user.role !== "admin") return res.status(403).json({ error: "Admin access required" });
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: "User ID required" });
+    await pool.query("UPDATE users SET banned_until=NULL, ban_reason=NULL, updated_at=NOW() WHERE id=$1", [userId]);
+    await pool.query("INSERT INTO moderation_logs (user_id, action, reason, created_at) VALUES ($1, $2, $3, NOW())", [userId, "admin_unban", "Unbanned by admin"]);
+    userCache.del(`user:${userId}`);
+    res.json({ ok: true });
+  } catch (err) { console.error("Failed to unban user:", err); res.status(500).json({ error: "Could not unban user" }); }
+});
+
+app.get("/api/user/match-history", requireAuth, async (req, res) => {
+  try {
+    const { page = 1, limit = 10 } = req.query;
+    const offset = (page - 1) * limit;
+    const { rows } = await pool.query(`SELECT m.*, CASE WHEN m.user_a = $1 THEN m.user_b ELSE m.user_a END as partner_id, u.username as partner_username, u.avatar as partner_avatar FROM matches m JOIN users u ON (CASE WHEN m.user_a = $1 THEN m.user_b ELSE m.user_a END) = u.id WHERE (m.user_a = $1 OR m.user_b = $1) ORDER BY m.created_at DESC LIMIT $2 OFFSET $3`, [req.user.id, limit, offset]);
+    const { rows: countRows } = await pool.query("SELECT COUNT(*) as total FROM matches WHERE user_a = $1 OR user_b = $1", [req.user.id]);
+    res.json({ matches: rows, pagination: { page: parseInt(page), limit: parseInt(limit), total: parseInt(countRows[0].total), pages: Math.ceil(countRows[0].total / limit) } });
+  } catch (err) { console.error("Failed to fetch match history:", err); res.status(500).json({ error: "Could not fetch match history" }); }
+});
+
+app.get("/api/admin/queue-stats", requireAuth, async (req, res) => {
+  try {
+    if (req.user.role !== "admin") return res.status(403).json({ error: "Admin access required" });
+    const queueCount = await getQueueCount();
+    const mode = useRedisForMatching ? "redis" : "local";
+    
+    let locationBreakdown = {};
+    let genderBreakdown = {};
+    
+    if (useRedisForMatching) {
+      const entries = await redisQueueGetAll();
+      for (const entry of entries) {
+        const loc = entry.location || "any";
+        const gen = entry.gender || "any";
+        locationBreakdown[loc] = (locationBreakdown[loc] || 0) + 1;
+        genderBreakdown[gen] = (genderBreakdown[gen] || 0) + 1;
+      }
+    } else {
+      for (const [_, entry] of localMatchQueue) {
+        const loc = entry.location || "any";
+        const gen = entry.gender || "any";
+        locationBreakdown[loc] = (locationBreakdown[loc] || 0) + 1;
+        genderBreakdown[gen] = (genderBreakdown[gen] || 0) + 1;
+      }
+    }
+    
+    res.json({
+      total: queueCount,
+      mode,
+      byLocation: locationBreakdown,
+      byGender: genderBreakdown,
+      redisConnected: !!redisClient,
+    });
+  } catch (err) { console.error("Failed to get queue stats:", err); res.status(500).json({ error: "Could not get queue stats" }); }
+});
+
+app.get("/health", (req, res) => {
+  res.json({ 
+    ok: true, 
+    env: process.env.NODE_ENV || "dev", 
+    timestamp: new Date().toISOString(), 
+    uptime: process.uptime(), 
+    redis: redisClient ? "connected" : "not_configured",
+    matchmaking: useRedisForMatching ? "redis" : "local",
+    queueSize: localMatchQueue.size,
+  });
+});
+
+cron.schedule("*/5 * * * *", async () => {
+  try {
+    const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
+    
+    for (const [userId, entry] of localMatchQueue) {
+      if (entry.ts < fiveMinutesAgo) {
+        const socketId = await getUserSocketId(userId);
+        if (!socketId) {
+          localMatchQueue.delete(userId);
+          if (useRedisForMatching) {
+            await redisQueueRemove(userId);
+          }
+          console.log(`🧹 Cleaned stale queue entry: ${userId}`);
+        }
+      }
+    }
+    
+    if (useRedisForMatching && redisClient) {
+      const staleKeys = await redisClient.keys("matchq:*");
+      for (const key of staleKeys) {
+        const userId = key.replace("matchq:", "");
+        const ts = await redisClient.hGet(key, "ts");
+        if (ts && parseInt(ts) < fiveMinutesAgo) {
+          const socketId = await getUserSocketId(userId);
+          if (!socketId) {
+            await redisQueueRemove(userId);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Queue cleanup error:", err.message);
+  }
+});
+
+cron.schedule("0 3 * * *", async () => {
+  try {
+    console.log("Running daily cleanup task");
+    await pool.query("DELETE FROM chat_messages WHERE created_at < NOW() - INTERVAL '30 days'");
+    await pool.query("DELETE FROM user_activity WHERE created_at < NOW() - INTERVAL '90 days'");
+    await pool.query("DELETE FROM appeals WHERE status IN ('approved', 'rejected') AND reviewed_at < NOW() - INTERVAL '180 days'");
+    console.log("Daily cleanup task completed");
+  } catch (err) { console.error("Error in daily cleanup task:", err); }
+});
+
+const PORT = process.env.PORT || 5000;
+async function startServer() {
+  await initRedis();
+  server.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`   Redis: ${redisClient ? "✅ connected" : "⚠️  not configured"}`);
+    console.log(`   Matchmaking: ${useRedisForMatching ? "🚀 Redis-powered" : "⚡ In-memory mode"}`);
+    console.log(`   Stripe: ${stripe ? "✅ configured" : "⚠️  not configured"}`);
+    console.log(`   Coinbase: ${ChargeResource ? "✅ configured" : "⚠️  not configured"}`);
+    console.log("");
+    console.log("📱 New socket events:");
+    console.log("   • join_queue - Join matchmaking queue");
+    console.log("   • leave_queue - Leave queue");
+    console.log("   • queue_status - Check queue position");
+    console.log("   • next - Skip current match and find next");
+    console.log("   • auto_requeue - Auto re-queue with saved preferences");
+  });
+}
+startServer().catch((err) => { console.error("Failed to start server:", err); process.exit(1); });
