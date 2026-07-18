@@ -1,3 +1,4 @@
+import Redis from 'ioredis';
 import { env, config } from '../config/index.js';
 import logger from '../utils/logger.js';
 
@@ -12,22 +13,22 @@ export async function initRedis() {
   }
 
   try {
-    const { createClient } = await import('redis');
-    
-    pubClient = createClient({ 
-      url: env.REDIS_URL,
-      socket: {
-        reconnectStrategy: (retries) => {
-          if (retries > 10) {
-            logger.error({ event: 'redis_max_retries' }, 'Redis max reconnection attempts reached');
-            return false;
-          }
-          return Math.min(retries * 100, 3000);
-        },
+    pubClient = new Redis(env.REDIS_URL, {
+      maxRetriesPerRequest: 3,
+      retryStrategy(times) {
+        if (times > 10) {
+          logger.error({ event: 'redis_max_retries' }, 'Redis max reconnection attempts reached');
+          return null; // Stop retrying
+        }
+        return Math.min(times * 100, 3000);
       },
+      lazyConnect: true,
     });
-    
-    subClient = pubClient.duplicate();
+
+    subClient = new Redis(env.REDIS_URL, {
+      maxRetriesPerRequest: null, // Subscribers don't need retry limit
+      lazyConnect: true,
+    });
 
     pubClient.on('error', (err) => {
       logger.error({ err, event: 'redis_error' }, 'Redis client error');
@@ -39,9 +40,9 @@ export async function initRedis() {
 
     await pubClient.connect();
     await subClient.connect();
-    
+
     redisClient = pubClient;
-    
+
     logger.info({ event: 'redis_connected' }, 'Redis connected successfully');
     return true;
   } catch (err) {
@@ -55,7 +56,7 @@ export function getRedisClient() {
 }
 
 export function isRedisConnected() {
-  return redisClient?.isReady ?? false;
+  return redisClient?.status === 'ready';
 }
 
 // Safe Redis operations with error handling
@@ -63,7 +64,8 @@ export const redis = {
   async get(key) {
     if (!redisClient) return null;
     try {
-      return await redisClient.get(key);
+      const value = await redisClient.get(key);
+      return value;
     } catch (err) {
       logger.error({ err, key, event: 'redis_get_error' }, 'Redis GET error');
       return null;
@@ -73,19 +75,23 @@ export const redis = {
   async set(key, value, options = {}) {
     if (!redisClient) return false;
     try {
-      return await redisClient.set(key, value, options);
+      if (options.EX) {
+        await redisClient.setex(key, options.EX, value);
+        return 'OK';
+      }
+      return await redisClient.set(key, value);
     } catch (err) {
       logger.error({ err, key, event: 'redis_set_error' }, 'Redis SET error');
       return false;
     }
   },
 
-  async del(key) {
+  async del(...keys) {
     if (!redisClient) return 0;
     try {
-      return await redisClient.del(key);
+      return await redisClient.del(...keys);
     } catch (err) {
-      logger.error({ err, key, event: 'redis_del_error' }, 'Redis DEL error');
+      logger.error({ err, keys, event: 'redis_del_error' }, 'Redis DEL error');
       return 0;
     }
   },
@@ -93,7 +99,7 @@ export const redis = {
   async hSet(key, data) {
     if (!redisClient) return 0;
     try {
-      return await redisClient.hSet(key, data);
+      return await redisClient.hset(key, data);
     } catch (err) {
       logger.error({ err, key, event: 'redis_hset_error' }, 'Redis HSET error');
       return 0;
@@ -103,7 +109,7 @@ export const redis = {
   async hGetAll(key) {
     if (!redisClient) return null;
     try {
-      return await redisClient.hGetAll(key);
+      return await redisClient.hgetall(key);
     } catch (err) {
       logger.error({ err, key, event: 'redis_hgetall_error' }, 'Redis HGETALL error');
       return null;
@@ -113,17 +119,23 @@ export const redis = {
   async zAdd(key, members) {
     if (!redisClient) return 0;
     try {
-      return await redisClient.zAdd(key, members);
+      // ioredis accepts: zadd(key, score, member, score, member, ...) or zadd(key, [{score, value}])
+      // Handle single member or array
+      if (Array.isArray(members) && members.length > 0) {
+        const args = members.flatMap(m => [m.score, m.value]);
+        return await redisClient.zadd(key, ...args);
+      }
+      return 0;
     } catch (err) {
       logger.error({ err, key, event: 'redis_zadd_error' }, 'Redis ZADD error');
       return 0;
     }
   },
 
-  async zRem(key, members) {
+  async zRem(key, ...members) {
     if (!redisClient) return 0;
     try {
-      return await redisClient.zRem(key, members);
+      return await redisClient.zrem(key, ...members);
     } catch (err) {
       logger.error({ err, key, event: 'redis_zrem_error' }, 'Redis ZREM error');
       return 0;
@@ -133,7 +145,7 @@ export const redis = {
   async zRange(key, start, stop) {
     if (!redisClient) return [];
     try {
-      return await redisClient.zRange(key, start, stop);
+      return await redisClient.zrange(key, start, stop);
     } catch (err) {
       logger.error({ err, key, event: 'redis_zrange_error' }, 'Redis ZRANGE error');
       return [];
@@ -143,7 +155,7 @@ export const redis = {
   async zCard(key) {
     if (!redisClient) return 0;
     try {
-      return await redisClient.zCard(key);
+      return await redisClient.zcard(key);
     } catch (err) {
       logger.error({ err, key, event: 'redis_zcard_error' }, 'Redis ZCARD error');
       return 0;
