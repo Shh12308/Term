@@ -13,50 +13,45 @@ export const pool = new Pool({
   connectionTimeoutMillis: 5000,
 });
 
-pool.on('connect', (client) => {
+pool.on('connect', () => {
   logger.debug({ event: 'db_connect' }, 'New database connection');
 });
 
 pool.on('error', (err) => {
+  console.error('❌ Unexpected database error:', err.message);
   logger.error({ err, event: 'db_error' }, 'Unexpected database error');
 });
 
-pool.on('remove', (client) => {
+pool.on('remove', () => {
   logger.debug({ event: 'db_remove' }, 'Database connection removed');
 });
 
 /**
- * Execute a query with optional transaction support
+ * Execute a query
  */
-export async function query(text, params, options = {}) {
+export async function query(text, params) {
   const start = Date.now();
   try {
     const result = await pool.query(text, params);
     const duration = Date.now() - start;
     
     if (duration > 100) {
-      logger.warn({ 
-        duration, 
-        query: text.substring(0, 100),
-        event: 'slow_query' 
-      }, 'Slow query detected');
+      logger.warn({ duration, query: text.substring(0, 100), event: 'slow_query' }, 'Slow query');
     }
     
     return result;
   } catch (err) {
-    logger.error({ 
-      err, 
-      query: text.substring(0, 100),
-      params: options.logParams ? params : undefined,
-      event: 'query_error' 
-    }, 'Query failed');
+    // Always log to console for visibility
+    console.error('❌ Query failed:', err.message);
+    console.error('   Query:', text.substring(0, 200));
+    if (params?.length) console.error('   Params:', params);
+    logger.error({ err, query: text.substring(0, 100), event: 'query_error' }, 'Query failed');
     throw err;
   }
 }
 
 /**
  * Execute a function within a database transaction
- * Handles commit/rollback automatically
  */
 export async function withTransaction(fn) {
   const client = await pool.connect();
@@ -79,12 +74,10 @@ export async function withTransaction(fn) {
 export async function testConnection() {
   try {
     const result = await pool.query('SELECT NOW() as now');
-    logger.info({ 
-      dbTime: result.rows[0].now,
-      event: 'db_connected' 
-    }, 'Database connected successfully');
+    logger.info({ dbTime: result.rows[0].now, event: 'db_connected' }, 'Database connected');
     return true;
   } catch (err) {
+    console.error('❌ Database connection failed:', err.message);
     logger.error({ err, event: 'db_connection_failed' }, 'Database connection failed');
     throw err;
   }
