@@ -4,14 +4,9 @@ import { cacheService } from '../services/cacheService.js';
 import { moderationService } from '../services/moderationService.js';
 import { requireAuth } from '../middleware/auth.js';
 import { validate } from '../middleware/validator.js';
-import { 
-  preferencesSchema, 
-  ageVerificationSchema, 
-  displayNameSchema, 
-  avatarSchema 
-} from '../middleware/validator.js';
+import { preferencesSchema, ageVerificationSchema, displayNameSchema, avatarSchema } from '../middleware/validator.js';
 import { config } from '../config/index.js';
-import { getClientIp } from '../utils/helpers.js';
+import { getClientIp, normalizeInterests, parseInterests } from '../utils/helpers.js';
 import geoip from 'geoip-lite';
 import logger from '../utils/logger.js';
 
@@ -29,11 +24,23 @@ router.get('/profile', requireAuth, async (req, res, next) => {
       [req.user.id]
     );
     
-    if (!rows.length) {
-      return res.status(404).json({ error: 'User not found' });
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+
+    let user = rows[0];
+    
+    // Parse interests from DB text string to array for client
+    user.interests = parseInterests(user.interests);
+
+    // Auto-detect location if not set
+    if (!user.location || user.location === 'any') {
+      const ip = getClientIp(req);
+      const geo = geoip.lookup(ip);
+      const loc = geo?.country?.toLowerCase() || 'any';
+      await query('UPDATE users SET location = $1 WHERE id = $2', [loc, req.user.id]);
+      user.location = loc;
     }
 
-    const user = rows[0];
+    // Cache the parsed user object
     await cacheService.set(`user:${user.id}`, user);
     
     res.json({
@@ -51,12 +58,10 @@ router.post('/preferences', requireAuth, validate(preferencesSchema), async (req
   try {
     const { gender, looking_for, location, interests, nickname } = req.validatedBody;
     
-    // Check ban status
     if (req.user.banned_until && new Date(req.user.banned_until) > new Date()) {
       return res.status(403).json({ error: 'Account banned' });
     }
 
-    // Auto-detect location if needed
     let finalLocation = location;
     if (!finalLocation || finalLocation === 'any') {
       const ip = getClientIp(req);
@@ -64,12 +69,16 @@ router.post('/preferences', requireAuth, validate(preferencesSchema), async (req
       finalLocation = geo?.country?.toLowerCase() || 'any';
     }
 
+    // Convert array to comma-separated string for DB text column
+    const interestsStr = normalizeInterests(interests);
+
     await query(
       `UPDATE users SET gender = $1, looking_for = $2, location = $3, interests = $4, 
        nickname = $5, updated_at = NOW() WHERE id = $6`,
-      [gender, looking_for, finalLocation, interests, nickname, req.user.id]
+      [gender, looking_for, finalLocation, interestsStr, nickname, req.user.id]
     );
 
+    // Return array format to client
     const updatedUser = { ...req.user, gender, looking_for, location: finalLocation, interests, nickname };
     await cacheService.set(`user:${req.user.id}`, updatedUser);
 
@@ -83,18 +92,11 @@ router.post('/preferences', requireAuth, validate(preferencesSchema), async (req
 router.post('/verify-age', requireAuth, validate(ageVerificationSchema), async (req, res, next) => {
   try {
     const { age } = req.validatedBody;
-    
     if (age < config.minAgeForVideo) {
-      return res.status(400).json({ 
-        error: `You must be at least ${config.minAgeForVideo} to use video features` 
-      });
+      return res.status(400).json({ error: `You must be at least ${config.minAgeForVideo} to use video features` });
     }
 
-    await query(
-      'UPDATE users SET age_verified = $1, updated_at = NOW() WHERE id = $2',
-      [true, req.user.id]
-    );
-
+    await query('UPDATE users SET age_verified = $1, updated_at = NOW() WHERE id = $2', [true, req.user.id]);
     const updatedUser = { ...req.user, age_verified: true };
     await cacheService.set(`user:${req.user.id}`, updatedUser);
 
@@ -109,7 +111,6 @@ router.post('/display-name', requireAuth, validate(displayNameSchema), async (re
   try {
     const { display_name } = req.validatedBody;
 
-    // Moderate display name
     if (config.isModerationEnabled) {
       const mod = await moderationService.checkText(display_name);
       if (mod.flagged) {
@@ -117,11 +118,7 @@ router.post('/display-name', requireAuth, validate(displayNameSchema), async (re
       }
     }
 
-    await query(
-      'UPDATE users SET username = $1, display_name = $1, updated_at = NOW() WHERE id = $2',
-      [display_name, req.user.id]
-    );
-
+    await query('UPDATE users SET username = $1, display_name = $1, updated_at = NOW() WHERE id = $2', [display_name, req.user.id]);
     const updatedUser = { ...req.user, username: display_name, display_name };
     await cacheService.set(`user:${req.user.id}`, updatedUser);
 
@@ -143,12 +140,10 @@ router.post('/avatar', requireAuth, validate(avatarSchema), async (req, res, nex
     if (metadata.width > 500 || metadata.height > 500) {
       return res.status(400).json({ error: 'Avatar must be at most 500x500 pixels' });
     }
-
     if (!['jpeg', 'jpg', 'png', 'webp'].includes(metadata.format)) {
       return res.status(400).json({ error: 'Avatar must be in JPEG, PNG, or WebP format' });
     }
 
-    // Moderate avatar
     if (config.isModerationEnabled) {
       const mod = await moderationService.checkImage(avatarBase64);
       if (mod.flagged) {
@@ -156,18 +151,10 @@ router.post('/avatar', requireAuth, validate(avatarSchema), async (req, res, nex
       }
     }
 
-    const processedImage = await sharp(buffer)
-      .resize({ width: 200, height: 200, fit: 'cover' })
-      .jpeg({ quality: 80 })
-      .toBuffer();
-
+    const processedImage = await sharp(buffer).resize({ width: 200, height: 200, fit: 'cover' }).jpeg({ quality: 80 }).toBuffer();
     const processedBase64 = `data:image/jpeg;base64,${processedImage.toString('base64')}`;
 
-    await query(
-      'UPDATE users SET avatar = $1, updated_at = NOW() WHERE id = $2',
-      [processedBase64, req.user.id]
-    );
-
+    await query('UPDATE users SET avatar = $1, updated_at = NOW() WHERE id = $2', [processedBase64, req.user.id]);
     const updatedUser = { ...req.user, avatar: processedBase64 };
     await cacheService.set(`user:${req.user.id}`, updatedUser);
 
