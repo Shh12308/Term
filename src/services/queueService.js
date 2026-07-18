@@ -1,7 +1,7 @@
 import { redis, isRedisConnected } from './redisService.js';
-import { query, withTransaction } from '../database/pool.js';
+import { query } from '../database/pool.js';
 import logger from '../utils/logger.js';
-import { config } from '../config/index.js';
+import { normalizeInterests, parseInterests } from '../utils/helpers.js';
 
 // Local fallback queue
 const localQueue = new Map();
@@ -38,7 +38,8 @@ export const queueService = {
       }
     }
     
-    // Always persist to database
+    // Persist to database (convert interests array to comma-separated string)
+    const interestsStr = normalizeInterests(entry.interests);
     await query(
       `INSERT INTO queue (user_id, gender, looking_for, location, interests, nickname, joined_at) 
        VALUES ($1, $2, $3, $4, $5, $6, NOW()) 
@@ -49,8 +50,8 @@ export const queueService = {
          interests = EXCLUDED.interests, 
          nickname = EXCLUDED.nickname, 
          joined_at = NOW()`,
-      [uid, entry.gender, entry.looking_for, entry.location, entry.interests, entry.nickname]
-    );
+      [uid, entry.gender, entry.looking_for, entry.location, interestsStr, entry.nickname]
+    ).catch(err => logger.error({ err, event: 'db_queue_add_error' }, 'Failed to save queue to DB'));
   },
 
   /**
@@ -82,24 +83,23 @@ export const queueService = {
         const userIds = await redis.zRange('match_queue', 0, -1);
         const entries = [];
         
-        // Pipeline for better performance
         for (const uid of userIds) {
           const data = await redis.hGetAll(`matchq:${uid}`);
           if (data?.userId) {
             entries.push({
               ...data,
-              interests: JSON.parse(data.interests || '[]'),
+              interests: safeJsonParse(data.interests, []),
               ts: parseInt(data.ts),
             });
           }
         }
-        
         return entries;
       } catch (err) {
         logger.error({ err, event: 'redis_queue_getall_error' }, 'Failed to get Redis queue');
       }
     }
     
+    // Fallback to local queue (interests are already arrays here)
     return Array.from(localQueue.values());
   },
 
@@ -134,19 +134,16 @@ export const queueService = {
     const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
     let cleaned = 0;
     
-    // Clean local queue
     for (const [userId, entry] of localQueue) {
       if (entry.ts < fiveMinutesAgo) {
         const socketId = await getSocketIdFn(userId);
         if (!socketId) {
           localQueue.delete(userId);
           cleaned++;
-          logger.debug({ userId, event: 'stale_local_entry' }, 'Cleaned stale local queue entry');
         }
       }
     }
     
-    // Clean Redis queue
     if (isRedisConnected()) {
       try {
         const keys = await redis.keys('matchq:*');
@@ -159,7 +156,6 @@ export const queueService = {
             if (!socketId) {
               await this.remove(userId);
               cleaned++;
-              logger.debug({ userId, event: 'stale_redis_entry' }, 'Cleaned stale Redis queue entry');
             }
           }
         }
@@ -168,9 +164,7 @@ export const queueService = {
       }
     }
     
-    // Clean database queue
     await query('DELETE FROM queue WHERE joined_at < NOW() - INTERVAL \'10 minutes\'').catch(() => {});
-    
     return cleaned;
   },
 
@@ -197,3 +191,7 @@ export const queueService = {
     return stats;
   },
 };
+
+function safeJsonParse(str, fallback) {
+  try { return JSON.parse(str); } catch { return fallback; }
+}
