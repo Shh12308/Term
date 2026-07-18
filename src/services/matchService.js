@@ -3,20 +3,12 @@ import { queueService } from './queueService.js';
 import { redis, isRedisConnected } from './redisService.js';
 import { config } from '../config/index.js';
 import logger from '../utils/logger.js';
-import { generateChannelName } from '../utils/helpers.js';
+import { generateChannelName, parseInterests } from '../utils/helpers.js';
 
-/**
- * Acquire a distributed lock for matchmaking
- */
 async function acquireLock(userId) {
   if (!isRedisConnected()) return true;
-  
   try {
-    const result = await redis.set(
-      `lock:match:${userId}`,
-      '1',
-      { NX: true, EX: config.matchLockTTL }
-    );
+    const result = await redis.set(`lock:match:${userId}`, '1', { NX: true, EX: config.matchLockTTL });
     return result === 'OK';
   } catch (err) {
     logger.error({ err, userId, event: 'lock_error' }, 'Failed to acquire match lock');
@@ -24,12 +16,8 @@ async function acquireLock(userId) {
   }
 }
 
-/**
- * Release a distributed lock
- */
 async function releaseLock(userId) {
   if (!isRedisConnected()) return;
-  
   try {
     await redis.del(`lock:match:${userId}`);
   } catch (err) {
@@ -37,9 +25,6 @@ async function releaseLock(userId) {
   }
 }
 
-/**
- * Get recently matched partners to avoid repeat matches
- */
 async function getRecentPartners(userId) {
   try {
     const { rows } = await query(
@@ -58,23 +43,19 @@ async function getRecentPartners(userId) {
   }
 }
 
-/**
- * Calculate match score between two users
- */
 function calculateScore(a, b, aWaitTime, bWaitTime) {
   let score = 0;
   const weights = config.matchWeights;
 
-  // Location matching
   if (a.location === b.location && a.location !== 'any') {
     score += weights.location;
   } else if (a.location === 'any' || b.location === 'any') {
     score += weights.location * 0.5;
   }
 
-  // Interest overlap
-  const aInterests = new Set(a.interests || []);
-  const bInterests = new Set(b.interests || []);
+  // Parse interests safely (handles both string and array formats)
+  const aInterests = new Set(parseInterests(a.interests));
+  const bInterests = new Set(parseInterests(b.interests));
   let overlap = 0;
   for (const interest of aInterests) {
     if (bInterests.has(interest)) overlap++;
@@ -82,12 +63,10 @@ function calculateScore(a, b, aWaitTime, bWaitTime) {
   const maxInterests = Math.max(aInterests.size, bInterests.size, 1);
   score += weights.interests * (overlap / maxInterests);
 
-  // Freshness (prefer users who waited longer)
   const maxWait = Math.max(aWaitTime, bWaitTime, 1000);
   const avgWaitRatio = ((aWaitTime + bWaitTime) / 2) / maxWait;
   score += weights.freshness * avgWaitRatio;
 
-  // Gender preference matching
   const aWantsB = a.looking_for === 'any' || a.looking_for === b.gender;
   const bWantsA = b.looking_for === 'any' || b.looking_for === a.gender;
   if (aWantsB && bWantsA) {
@@ -100,10 +79,6 @@ function calculateScore(a, b, aWaitTime, bWaitTime) {
 }
 
 export const matchService = {
-  /**
-   * Try to find a match for a user
-   * Uses database transaction to prevent race conditions
-   */
   async tryMatch(requesterUserId, getSocketIdFn, io) {
     const now = Date.now();
     
@@ -117,9 +92,7 @@ export const matchService = {
       const allEntries = await queueService.getAll();
       const requester = allEntries.find(e => String(e.userId) === String(requesterUserId));
       
-      if (!requester) {
-        return null;
-      }
+      if (!requester) return null;
 
       const recentPartners = await getRecentPartners(requesterUserId);
       
@@ -148,9 +121,7 @@ export const matchService = {
         candidatesEvaluated++;
       }
 
-      if (!bestCandidate || bestScore < 20) {
-        return null;
-      }
+      if (!bestCandidate || bestScore < 20) return null;
 
       const requesterSocketId = await getSocketIdFn(String(requesterUserId));
       const candidateSocketId = await getSocketIdFn(String(bestCandidate.userId));
@@ -162,14 +133,11 @@ export const matchService = {
       }
 
       const candidateLockAcquired = await acquireLock(bestCandidate.userId);
-      if (!candidateLockAcquired) {
-        return null;
-      }
+      if (!candidateLockAcquired) return null;
 
       try {
-        // CRITICAL: Use database transaction to prevent duplicate matches
+        // CRITICAL: Database transaction to prevent race conditions
         const matchResult = await withTransaction(async (client) => {
-          // Check for existing active match with FOR UPDATE lock
           const { rows: existingMatches } = await client.query(
             `SELECT id FROM matches 
              WHERE (user_a = $1 OR user_b = $1 OR user_a = $2 OR user_b = $2)
@@ -178,11 +146,8 @@ export const matchService = {
             [requesterUserId, bestCandidate.userId]
           );
           
-          if (existingMatches.length > 0) {
-            return null; // Already in a match
-          }
+          if (existingMatches.length > 0) return null;
 
-          // Check queue status with lock
           const { rows: inQueue } = await client.query(
             `SELECT user_id FROM queue 
              WHERE user_id IN ($1, $2)
@@ -190,11 +155,8 @@ export const matchService = {
             [requesterUserId, bestCandidate.userId]
           );
           
-          if (inQueue.length < 2) {
-            return null; // One or both not in queue
-          }
+          if (inQueue.length < 2) return null;
 
-          // Create the match
           const channelName = generateChannelName(requesterUserId, bestCandidate.userId);
           
           const { rows: [match] } = await client.query(
@@ -204,18 +166,14 @@ export const matchService = {
             [requesterUserId, bestCandidate.userId, channelName]
           );
 
-          // Remove from queue
           await client.query('DELETE FROM queue WHERE user_id = $1', [requesterUserId]);
           await client.query('DELETE FROM queue WHERE user_id = $1', [bestCandidate.userId]);
 
           return match;
         });
 
-        if (!matchResult) {
-          return null;
-        }
+        if (!matchResult) return null;
 
-        // Remove from in-memory/Redis queues (outside transaction - eventual consistency)
         await queueService.remove(requesterUserId);
         await queueService.remove(bestCandidate.userId);
 
@@ -225,7 +183,7 @@ export const matchService = {
           avatar: requester.avatar || '',
           gender: requester.gender || 'any',
           location: requester.location || 'any',
-          interests: requester.interests || [],
+          interests: parseInterests(requester.interests),
         };
 
         const candidateInfo = {
@@ -234,10 +192,9 @@ export const matchService = {
           avatar: bestCandidate.avatar || '',
           gender: bestCandidate.gender || 'any',
           location: bestCandidate.location || 'any',
-          interests: bestCandidate.interests || [],
+          interests: parseInterests(bestCandidate.interests),
         };
 
-        // Emit to both users
         io.to(requesterSocketId).emit('match_found', {
           peerId: bestCandidate.userId,
           channel: matchResult.channel_name,
@@ -259,10 +216,7 @@ export const matchService = {
           event: 'match_found' 
         }, 'Users matched');
 
-        return { 
-          peerId: bestCandidate.userId, 
-          channel: matchResult.channel_name 
-        };
+        return { peerId: bestCandidate.userId, channel: matchResult.channel_name };
       } finally {
         await releaseLock(bestCandidate.userId);
       }
@@ -271,28 +225,18 @@ export const matchService = {
     }
   },
 
-  /**
-   * End a match
-   */
   async endMatch(userId) {
     const { rows } = await query(
-      `UPDATE matches 
-       SET ended_at = NOW() 
-       WHERE (user_a = $1 OR user_b = $1) 
-       AND ended_at IS NULL
+      `UPDATE matches SET ended_at = NOW() 
+       WHERE (user_a = $1 OR user_b = $1) AND ended_at IS NULL
        RETURNING *`,
       [userId]
     );
-    
     return rows[0] || null;
   },
 
-  /**
-   * Get match history for a user
-   */
   async getHistory(userId, page = 1, limit = 10) {
     const offset = (page - 1) * limit;
-    
     const { rows } = await query(
       `SELECT m.*, 
               CASE WHEN m.user_a = $1 THEN m.user_b ELSE m.user_a END as partner_id,
