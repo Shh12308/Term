@@ -3,18 +3,19 @@ import { env, config } from './config/index.js';
 import app from './app.js';
 import { initSocketIO } from './sockets/index.js';
 import { initRedis, isRedisConnected } from './services/redisService.js';
-import { testConnection, runMigrations } from './database/migrations.js';
+import { testConnection } from './database/pool.js';
+import { runMigrations } from './database/migrations.js';
 import { startQueueCleanup } from './jobs/cleanup.js';
 import { startDailyPurge } from './jobs/dailyPurge.js';
 import { startBanExpiryCheck } from './jobs/banExpiry.js';
 import logger from './utils/logger.js';
 
-// Setup Passport (separate file would be cleaner, but keeping it here for session config)
+// Setup Passport (session config)
 import session from 'express-session';
 import pgSessionImport from 'connect-pg-simple';
 import passport from 'passport';
 import { pool } from './database/pool.js';
-import './passport/strategies.js'; // Register strategies
+import './passport/strategies.js';
 
 const PGStore = pgSessionImport(session);
 
