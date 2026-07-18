@@ -44,11 +44,21 @@ export function generateRequestId() {
 }
 
 /**
- * Normalize and validate interests array
+ * Normalize interests array to comma-separated string for DB (text column)
  */
 export function normalizeInterests(interests, maxLength = 5, itemMaxLength = 30) {
-  if (!Array.isArray(interests)) return [];
+  if (!Array.isArray(interests)) return '';
   return interests
     .filter(i => typeof i === 'string' && i.length > 0 && i.length <= itemMaxLength)
-    .slice(0, maxLength);
+    .slice(0, maxLength)
+    .join(',');
+}
+
+/**
+ * Parse interests from DB text string back to array
+ */
+export function parseInterests(interestsStr) {
+  if (Array.isArray(interestsStr)) return interestsStr.filter(i => i.length > 0);
+  if (!interestsStr || typeof interestsStr !== 'string') return [];
+  return interestsStr.split(',').filter(i => i.length > 0);
 }
