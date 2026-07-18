@@ -26,18 +26,35 @@ function oauthCallback(provider) {
   };
 }
 
-// Google OAuth
-router.get('/google', authLimiter, passport.authenticate('google', { scope: ['profile', 'email'] }));
-router.get('/google/callback', authLimiter, passport.authenticate('google', { failureRedirect: '/auth/failure', session: true }), oauthCallback('google'));
+router.get(
+  '/google/callback',
+  authLimiter,
+  passport.authenticate('google', {
+    failureRedirect: '/auth/failure',
+    session: false
+  }),
+  oauthCallback('google')
+);
 
-// Discord OAuth
-router.get('/discord', authLimiter, passport.authenticate('discord'));
-router.get('/discord/callback', authLimiter, passport.authenticate('discord', { failureRedirect: '/auth/failure', session: true }), oauthCallback('discord'));
+router.get(
+  '/discord/callback',
+  authLimiter,
+  passport.authenticate('discord', {
+    failureRedirect: '/auth/failure',
+    session: false
+  }),
+  oauthCallback('discord')
+);
 
-// Facebook OAuth
-router.get('/facebook', authLimiter, passport.authenticate('facebook', { scope: ['email'] }));
-router.get('/callback/facebook', authLimiter, passport.authenticate('facebook', { failureRedirect: '/auth/failure', session: true }), oauthCallback('facebook'));
-
+router.get(
+  '/callback/facebook',
+  authLimiter,
+  passport.authenticate('facebook', {
+    failureRedirect: '/auth/failure',
+    session: false
+  }),
+  oauthCallback('facebook')
+);
 // Get current user
 router.get('/me', async (req, res, next) => {
   try {
