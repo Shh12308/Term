@@ -1,88 +1,163 @@
 import { query } from './pool.js';
-import logger from '../utils/logger.js';
+
+/**
+ * Safely create an index only if table/column exist and index doesn't exist
+ */
+async function safeCreateIndex(indexName, table, column, where = '') {
+  try {
+    const { rows: tableExists } = await query(
+      `SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = $1)`,
+      [table]
+    );
+    if (!tableExists[0].exists) return;
+
+    const { rows: colExists } = await query(
+      `SELECT EXISTS (SELECT FROM information_schema.columns WHERE table_name = $1 AND column_name = $2)`,
+      [table, column]
+    );
+    if (!colExists[0].exists) return;
+
+    const { rows: idxExists } = await query(
+      `SELECT EXISTS (SELECT FROM pg_indexes WHERE indexname = $1)`,
+      [indexName]
+    );
+    if (idxExists[0].exists) return;
+
+    await query(`CREATE INDEX ${indexName} ON ${table}(${column}) ${where}`);
+    console.log(`   ✅ ${indexName}`);
+  } catch (err) {
+    console.log(`   ⚠️  ${indexName}: ${err.message.substring(0, 60)}`);
+  }
+}
+
+/**
+ * Safely add column if it doesn't exist
+ */
+async function safeAddColumn(table, column, type, defaultVal = '') {
+  try {
+    const { rows: exists } = await query(
+      `SELECT EXISTS (SELECT FROM information_schema.columns WHERE table_name = $1 AND column_name = $2)`,
+      [table, column]
+    );
+    if (exists[0].exists) return;
+
+    await query(`ALTER TABLE ${table} ADD COLUMN ${column} ${type} ${defaultVal}`);
+    console.log(`   ✅ Added ${table}.${column}`);
+  } catch (err) {
+    console.log(`   ⚠️  ${table}.${column}: ${err.message.substring(0, 60)}`);
+  }
+}
 
 const migrations = [
   {
-    name: '001_create_appeals_table',
-    up: `
-      CREATE TABLE IF NOT EXISTS appeals (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        message TEXT NOT NULL,
-        status VARCHAR(20) DEFAULT 'pending',
-        admin_response TEXT,
-        admin_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-        created_at TIMESTAMP DEFAULT NOW(),
-        reviewed_at TIMESTAMP
-      );
-    `,
+    name: '001_fix_chat_messages',
+    up: async () => {
+      console.log('   Adding room_id to chat_messages...');
+      await safeAddColumn('chat_messages', 'room_id', 'TEXT');
+    },
   },
   {
-    name: '002_create_coin_transactions_table',
-    up: `
-      CREATE TABLE IF NOT EXISTS coin_transactions (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        coins INTEGER NOT NULL,
-        amount DECIMAL(10,2) NOT NULL DEFAULT 0,
-        transaction_type VARCHAR(30) NOT NULL,
-        gift_type VARCHAR(30),
-        recipient_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-        transaction_id VARCHAR(255),
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-    `,
+    name: '002_fix_user_activity',
+    up: async () => {
+      console.log('   Adding action/metadata to user_activity...');
+      await safeAddColumn('user_activity', 'action', 'VARCHAR(50)');
+      await safeAddColumn('user_activity', 'metadata', 'TEXT');
+    },
   },
   {
-    name: '003_add_user_columns',
-    up: `
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS coins INTEGER DEFAULT 0;
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS looking_for VARCHAR(20) DEFAULT 'any';
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'user';
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS age_verified BOOLEAN DEFAULT FALSE;
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_until TIMESTAMP;
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason TEXT;
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS nickname VARCHAR(20);
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR(20);
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS interests TEXT[] DEFAULT '{}';
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS gender VARCHAR(20) DEFAULT 'any';
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS location VARCHAR(50) DEFAULT 'any';
-    `,
+    name: '003_fix_coin_transactions',
+    up: async () => {
+      console.log('   Adding missing columns to coin_transactions...');
+      await safeAddColumn('coin_transactions', 'transaction_type', 'VARCHAR(30)');
+      await safeAddColumn('coin_transactions', 'gift_type', 'VARCHAR(30)');
+      await safeAddColumn('coin_transactions', 'recipient_id', 'INTEGER');
+    },
   },
   {
-    name: '004_add_queue_columns',
-    up: `
-      ALTER TABLE queue ADD COLUMN IF NOT EXISTS looking_for VARCHAR(20) DEFAULT 'any';
-      ALTER TABLE queue ADD COLUMN IF NOT EXISTS gender VARCHAR(20) DEFAULT 'any';
-      ALTER TABLE queue ADD COLUMN IF NOT EXISTS location VARCHAR(50) DEFAULT 'any';
-      ALTER TABLE queue ADD COLUMN IF NOT EXISTS interests TEXT[] DEFAULT '{}';
-      ALTER TABLE queue ADD COLUMN IF NOT EXISTS nickname VARCHAR(20);
-    `,
+    name: '004_create_missing_tables',
+    up: async () => {
+      console.log('   Creating missing tables...');
+
+      await query(`
+        CREATE TABLE IF NOT EXISTS user_reports (
+          id SERIAL PRIMARY KEY,
+          reporter_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+          reported_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+          reason TEXT NOT NULL,
+          room_id TEXT,
+          created_at TIMESTAMP DEFAULT NOW()
+        )
+      `).then(() => console.log('   ✅ user_reports'));
+
+      await query(`
+        CREATE TABLE IF NOT EXISTS moderation_logs (
+          id SERIAL PRIMARY KEY,
+          user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+          action VARCHAR(50) NOT NULL,
+          reason TEXT,
+          created_at TIMESTAMP DEFAULT NOW()
+        )
+      `).then(() => console.log('   ✅ moderation_logs'));
+
+      await query(`
+        CREATE TABLE IF NOT EXISTS flagged_users (
+          id SERIAL PRIMARY KEY,
+          user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+          reason TEXT,
+          created_at TIMESTAMP DEFAULT NOW()
+        )
+      `).then(() => console.log('   ✅ flagged_users'));
+
+      await query(`
+        CREATE TABLE IF NOT EXISTS room_activity (
+          id SERIAL PRIMARY KEY,
+          user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+          room_id TEXT NOT NULL,
+          action VARCHAR(30) NOT NULL,
+          created_at TIMESTAMP DEFAULT NOW()
+        )
+      `).then(() => console.log('   ✅ room_activity'));
+    },
   },
   {
     name: '005_create_indexes',
-    up: `
-      CREATE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL;
-      CREATE INDEX IF NOT EXISTS idx_users_provider_id ON users(provider_id) WHERE provider_id IS NOT NULL;
-      CREATE INDEX IF NOT EXISTS idx_users_banned_until ON users(banned_until) WHERE banned_until IS NOT NULL;
-      CREATE INDEX IF NOT EXISTS idx_users_location ON users(location) WHERE location IS NOT NULL AND location != 'any';
-      CREATE INDEX IF NOT EXISTS idx_matches_user_a ON matches(user_a);
-      CREATE INDEX IF NOT EXISTS idx_matches_user_b ON matches(user_b);
-      CREATE INDEX IF NOT EXISTS idx_matches_channel_name ON matches(channel_name);
-      CREATE INDEX IF NOT EXISTS idx_matches_created_at ON matches(created_at);
-      CREATE INDEX IF NOT EXISTS idx_matches_active ON matches(ended_at) WHERE ended_at IS NULL;
-      CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room_id);
-      CREATE INDEX IF NOT EXISTS idx_chat_messages_created_at ON chat_messages(created_at);
-      CREATE INDEX IF NOT EXISTS idx_queue_user_id ON queue(user_id);
-      CREATE INDEX IF NOT EXISTS idx_queue_joined_at ON queue(joined_at);
-      CREATE INDEX IF NOT EXISTS idx_user_reports_reported ON user_reports(reported_id, created_at);
-      CREATE INDEX IF NOT EXISTS idx_user_reports_reporter ON user_reports(reporter_id, created_at);
-      CREATE INDEX IF NOT EXISTS idx_coin_transactions_user ON coin_transactions(user_id, created_at);
-      CREATE INDEX IF NOT EXISTS idx_user_activity_user_action ON user_activity(user_id, action, created_at);
-      CREATE INDEX IF NOT EXISTS idx_moderation_logs_user ON moderation_logs(user_id, created_at);
-      CREATE INDEX IF NOT EXISTS idx_flagged_users ON flagged_users(created_at);
-      CREATE INDEX IF NOT EXISTS idx_appeals_status ON appeals(status) WHERE status = 'pending';
-    `,
+    up: async () => {
+      console.log('   Creating indexes...');
+
+      // Users
+      await safeCreateIndex('idx_users_banned_until', 'users', 'banned_until', 'WHERE banned_until IS NOT NULL');
+      await safeCreateIndex('idx_users_role', 'users', 'role');
+      
+      // Matches
+      await safeCreateIndex('idx_matches_user_a', 'matches', 'user_a');
+      await safeCreateIndex('idx_matches_user_b', 'matches', 'user_b');
+      await safeCreateIndex('idx_matches_created_at', 'matches', 'created_at');
+      await safeCreateIndex('idx_matches_active', 'matches', 'ended_at', 'WHERE ended_at IS NULL');
+
+      // Chat messages
+      await safeCreateIndex('idx_chat_messages_room_id', 'chat_messages', 'room_id');
+      await safeCreateIndex('idx_chat_messages_created_at', 'chat_messages', 'created_at');
+
+      // Queue (idx_queue_joined_at already exists)
+      await safeCreateIndex('idx_queue_looking_for', 'queue', 'looking_for');
+
+      // Reports
+      await safeCreateIndex('idx_user_reports_reported', 'user_reports', 'reported_id');
+      await safeCreateIndex('idx_user_reports_reporter', 'user_reports', 'reporter_id');
+
+      // Coin transactions
+      await safeCreateIndex('idx_coin_transactions_user', 'coin_transactions', 'user_id');
+
+      // Activity
+      await safeCreateIndex('idx_user_activity_action', 'user_activity', 'action');
+
+      // Moderation
+      await safeCreateIndex('idx_moderation_logs_user', 'moderation_logs', 'user_id');
+      await safeCreateIndex('idx_flagged_users_created', 'flagged_users', 'created_at');
+
+      // Appeals
+      await safeCreateIndex('idx_appeals_status', 'appeals', 'status', "WHERE status = 'pending'");
+    },
   },
 ];
 
@@ -91,7 +166,7 @@ const migrations = [
  */
 export async function runMigrations() {
   try {
-    // Create migrations tracking table
+    // Ensure schema_migrations table exists
     await query(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
         name VARCHAR(100) PRIMARY KEY,
@@ -109,38 +184,30 @@ export async function runMigrations() {
         continue;
       }
 
-      console.log(`🔄 Running migration: ${migration.name}`);
-      logger.info({ migration: migration.name }, 'Running migration');
-      
+      console.log(`🔄 ${migration.name}`);
+
       try {
-        await query(migration.up);
+        if (typeof migration.up === 'function') {
+          await migration.up();
+        } else if (typeof migration.up === 'string') {
+          await query(migration.up);
+        }
+
         await query(
           'INSERT INTO schema_migrations (name) VALUES ($1)',
           [migration.name]
         );
-        console.log(`✅ Migration completed: ${migration.name}`);
-        logger.info({ migration: migration.name }, 'Migration completed');
+        console.log(`✅ Done: ${migration.name}\n`);
       } catch (err) {
-        console.error(`❌ Migration failed: ${migration.name}`);
-        console.error(`   Error: ${err.message}`);
-        
-        // If it's a missing table/reference error, log helpful info
-        if (err.message.includes('does not exist')) {
-          const missing = err.message.match(/relation "(\w+)" does not exist/);
-          if (missing) {
-            console.error(`   Missing table: "${missing[1]}" - create it first or run migrations in order`);
-          }
-        }
-        
+        console.error(`❌ Failed: ${migration.name}`);
+        console.error(`   ${err.message}`);
         throw err;
       }
     }
 
-    console.log('✅ All migrations up to date');
-    logger.info({ event: 'migrations_complete' }, 'All migrations up to date');
+    console.log('✅ All migrations up to date\n');
   } catch (err) {
-    console.error('❌ Migration system failed:', err.message);
-    logger.error({ err, event: 'migration_failed' }, 'Migration failed');
+    console.error('❌ Migration failed:', err.message);
     throw err;
   }
 }
