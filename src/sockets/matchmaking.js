@@ -13,12 +13,9 @@ export function registerMatchmakingHandlers(io, socket) {
   const user = socket.data.user;
 
   socket.on('join_queue', async (data = {}) => {
-    if (!userId) {
-      return socket.emit('error', { message: 'Not authenticated' });
-    }
+    if (!userId) return socket.emit('error', { message: 'Not authenticated' });
 
     try {
-      // Check for active match
       const { rows: activeMatch } = await query(
         'SELECT id FROM matches WHERE (user_a = $1 OR user_b = $1) AND ended_at IS NULL',
         [userId]
@@ -27,30 +24,27 @@ export function registerMatchmakingHandlers(io, socket) {
         return socket.emit('error', { message: "You're already in a match" });
       }
 
-      // Check ban status
       if (user.banned_until && new Date(user.banned_until) > new Date()) {
         return socket.emit('error', { message: 'Account is banned' });
       }
 
-      // Check age verification
       if (!user.age_verified) {
         return socket.emit('error', { message: 'Age verification required for video features' });
       }
 
-      // Validate and normalize nickname
       const nickname = data.nickname || user.nickname || '';
       if (nickname && (nickname.length > config.maxNicknameLength || nickname.length < 1)) {
         return socket.emit('error', { message: `Nickname must be between 1 and ${config.maxNicknameLength} characters` });
       }
 
-      // Validate and normalize interests
-      const interests = normalizeInterests(data.interests || user.interests || [], config.maxInterests);
+      // Normalize interests to array for in-memory/Redis, will convert to string for DB inside queueService
+      let interests = data.interests || user.interests || [];
+      if (!Array.isArray(interests)) interests = [];
+      interests = interests.filter(i => typeof i === 'string' && i.length > 0 && i.length <= 30).slice(0, config.maxInterests);
 
-      // Get location
       let location = data.location || user.location || 'any';
       if (!location || location === 'any') {
-        const ip = socket.handshake.headers['x-forwarded-for']?.split(',')[0] 
-          || socket.handshake.address;
+        const ip = socket.handshake.headers['x-forwarded-for']?.split(',')[0] || socket.handshake.address;
         const geo = geoip.lookup(ip);
         location = geo?.country?.toLowerCase() || 'any';
       }
@@ -61,22 +55,22 @@ export function registerMatchmakingHandlers(io, socket) {
         gender: data.gender || user.gender || 'any',
         looking_for: data.looking_for || user.looking_for || 'any',
         location,
-        interests,
+        interests, // Keep as array for fast matching
         nickname,
         username: user.username || 'User',
         avatar: user.avatar || '',
         ts: Date.now(),
       };
 
-      // Add to queue
       await queueService.add(queueEntry);
       socket.data.inQueue = true;
 
-      // Update user preferences
+      // Save to users table (normalize interests to string for DB text column)
+      const interestsStr = normalizeInterests(interests);
       await query(
         `UPDATE users SET gender = $1, looking_for = $2, location = $3, interests = $4, nickname = $5, updated_at = NOW()
          WHERE id = $6`,
-        [queueEntry.gender, queueEntry.looking_for, location, interests, nickname, userId]
+        [queueEntry.gender, queueEntry.looking_for, location, interestsStr, nickname, userId]
       );
       await cacheService.invalidateUser(userId);
 
@@ -90,7 +84,6 @@ export function registerMatchmakingHandlers(io, socket) {
 
       logger.info({ userId, queueCount, event: 'queue_joined' }, 'User joined queue');
 
-      // Try to find a match
       const match = await matchService.tryMatch(userId, getOnlineSocketId, io);
       
       if (match) {
@@ -109,7 +102,6 @@ export function registerMatchmakingHandlers(io, socket) {
 
   socket.on('leave_queue', async () => {
     if (!userId) return;
-    
     try {
       await queueService.remove(userId);
       socket.data.inQueue = false;
@@ -122,7 +114,6 @@ export function registerMatchmakingHandlers(io, socket) {
 
   socket.on('queue_status', async () => {
     if (!userId) return;
-    
     try {
       const queueCount = await queueService.getCount();
       socket.emit('queue_status', {
@@ -136,12 +127,9 @@ export function registerMatchmakingHandlers(io, socket) {
 
   socket.on('next', async () => {
     if (!userId) return;
-
     try {
-      // End current match
       await matchService.endMatch(userId);
 
-      // Leave all rooms
       for (const room of socket.rooms) {
         if (room !== socket.id) {
           socket.leave(room);
@@ -149,7 +137,6 @@ export function registerMatchmakingHandlers(io, socket) {
         }
       }
 
-      // Get saved preferences for auto-requeue
       const cachedEntry = queueService.getLocal(String(userId));
       const preferences = cachedEntry ? {
         gender: cachedEntry.gender,
