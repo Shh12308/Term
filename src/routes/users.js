@@ -53,6 +53,66 @@ router.get('/profile', requireAuth, async (req, res, next) => {
   }
 });
 
+// Get user preferences (alias for profile, returns just preference fields)
+router.get('/preferences', requireAuth, async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      `SELECT gender, looking_for, location, interests, nickname, display_name 
+       FROM users WHERE id = $1`,
+      [req.user.id]
+    );
+    
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+
+    const user = rows[0];
+    
+    // Parse interests from DB text string to array
+    user.interests = parseInterests(user.interests);
+
+    res.json(user);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Get user profile (full profile)
+router.get('/profile', requireAuth, async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      `SELECT id, username, email, provider, avatar, gender, looking_for, location, 
+              interests, nickname, display_name, age_verified, created_at, updated_at, 
+              coins, role, 
+              GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (NOW() - created_at)) / 3600)) as level 
+       FROM users WHERE id = $1`,
+      [req.user.id]
+    );
+    
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+
+    let user = rows[0];
+    user.interests = parseInterests(user.interests);
+
+    // Auto-detect location if not set
+    if (!user.location || user.location === 'any') {
+      const ip = getClientIp(req);
+      const geo = geoip.lookup(ip);
+      const loc = geo?.country?.toLowerCase() || 'any';
+      await query('UPDATE users SET location = $1 WHERE id = $2', [loc, req.user.id]);
+      user.location = loc;
+    }
+
+    await cacheService.set(`user:${user.id}`, user);
+    
+    res.json({
+      ...user,
+      display_name: user.display_name || user.username,
+      is_admin: user.role === 'admin',
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Update preferences
 router.post('/preferences', requireAuth, validate(preferencesSchema), async (req, res, next) => {
   try {
