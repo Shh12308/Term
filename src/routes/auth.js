@@ -27,7 +27,7 @@ function oauthCallback(provider) {
 }
 
 router.get(
-  '/google/callback',
+  '/auth/google/callback',
   authLimiter,
   passport.authenticate('google', {
     failureRedirect: '/auth/failure',
@@ -37,7 +37,7 @@ router.get(
 );
 
 router.get(
-  '/discord/callback',
+  '/auth/discord/callback',
   authLimiter,
   passport.authenticate('discord', {
     failureRedirect: '/auth/failure',
@@ -47,7 +47,7 @@ router.get(
 );
 
 router.get(
-  '/callback/facebook',
+  '/auth/callback/facebook',
   authLimiter,
   passport.authenticate('facebook', {
     failureRedirect: '/auth/failure',
