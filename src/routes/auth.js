@@ -26,8 +26,17 @@ function oauthCallback(provider) {
   };
 }
 
+// Google
 router.get(
-  '/auth/google/callback',
+  '/google',
+  authLimiter,
+  passport.authenticate('google', {
+    scope: ['profile', 'email']
+  })
+);
+
+router.get(
+  '/google/callback',
   authLimiter,
   passport.authenticate('google', {
     failureRedirect: '/auth/failure',
@@ -36,8 +45,15 @@ router.get(
   oauthCallback('google')
 );
 
+// Discord
 router.get(
-  '/auth/discord/callback',
+  '/discord',
+  authLimiter,
+  passport.authenticate('discord')
+);
+
+router.get(
+  '/discord/callback',
   authLimiter,
   passport.authenticate('discord', {
     failureRedirect: '/auth/failure',
@@ -46,8 +62,17 @@ router.get(
   oauthCallback('discord')
 );
 
+// Facebook
 router.get(
-  '/auth/callback/facebook',
+  '/facebook',
+  authLimiter,
+  passport.authenticate('facebook', {
+    scope: ['email']
+  })
+);
+
+router.get(
+  '/facebook/callback',
   authLimiter,
   passport.authenticate('facebook', {
     failureRedirect: '/auth/failure',
@@ -55,6 +80,7 @@ router.get(
   }),
   oauthCallback('facebook')
 );
+
 // Get current user
 router.get('/me', async (req, res, next) => {
   try {
