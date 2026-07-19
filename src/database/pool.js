@@ -7,23 +7,23 @@ const { Pool } = pg;
 export const pool = new Pool({
   connectionString: env.DATABASE_URL,
   ssl: env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined,
-  max: 20,
-  min: 2,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
+  max: 10,
+  min: 1,
+  // CRITICAL: Set lower than Neon's 5-minute timeout to prevent "unexpectedly terminated" errors
+  idleTimeoutMillis: 10000, 
+  connectionTimeoutMillis: 10000,
+  // Recycle connections periodically to prevent memory leaks
+  maxUses: 7500, 
 });
 
-pool.on('connect', () => {
-  logger.debug({ event: 'db_connect' }, 'New database connection');
-});
-
+// Only log actual critical pool errors, not routine disconnects
 pool.on('error', (err) => {
-  console.error('❌ Unexpected database error:', err.message);
-  logger.error({ err, event: 'db_error' }, 'Unexpected database error');
-});
-
-pool.on('remove', () => {
-  logger.debug({ event: 'db_remove' }, 'Database connection removed');
+  // Ignore "Connection terminated unexpectedly" as we handle it via idle timeout
+  if (err.message?.includes('Connection terminated unexpectedly')) {
+    return; 
+  }
+  console.error('❌ Critical database error:', err.message);
+  logger.error({ err, event: 'db_critical_error' }, 'Critical database error');
 });
 
 /**
@@ -35,17 +35,17 @@ export async function query(text, params) {
     const result = await pool.query(text, params);
     const duration = Date.now() - start;
     
-    if (duration > 100) {
+    // Increased to 1000ms - serverless DBs naturally have higher latency
+    if (duration > 1000) {
       logger.warn({ duration, query: text.substring(0, 100), event: 'slow_query' }, 'Slow query');
     }
     
     return result;
   } catch (err) {
-    // Always log to console for visibility
-    console.error('❌ Query failed:', err.message);
-    console.error('   Query:', text.substring(0, 200));
-    if (params?.length) console.error('   Params:', params);
-    logger.error({ err, query: text.substring(0, 100), event: 'query_error' }, 'Query failed');
+    // Only log actual query syntax/permission errors, not connection drops
+    if (!err.message?.includes('terminated') && !err.message?.includes('connect')) {
+      logger.error({ err, query: text.substring(0, 100), event: 'query_error' }, 'Query failed');
+    }
     throw err;
   }
 }
@@ -78,7 +78,6 @@ export async function testConnection() {
     return true;
   } catch (err) {
     console.error('❌ Database connection failed:', err.message);
-    logger.error({ err, event: 'db_connection_failed' }, 'Database connection failed');
     throw err;
   }
 }
