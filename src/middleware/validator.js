@@ -1,17 +1,26 @@
 import { z } from 'zod';
 import { ValidationError } from '../utils/errors.js';
 
+// Helper: Coerce various input formats to a string array
+const stringArray = z.preprocess((val) => {
+  if (Array.isArray(val)) return val;
+  if (typeof val === 'string') {
+    return val.split(',').map(s => s.trim()).filter(Boolean);
+  }
+  return [];
+}, z.array(z.string().max(30)).max(5));
+
 // User schemas
 export const preferencesSchema = z.object({
   gender: z.enum(['male', 'female', 'any']).optional().default('any'),
   looking_for: z.enum(['male', 'female', 'any']).optional().default('any'),
   location: z.string().max(50).optional().default('any'),
-  interests: z.array(z.string().max(30)).max(5).optional().default([]),
-  nickname: z.string().min(1).max(20).optional().default(''),
+  interests: stringArray.optional().default([]),
+  nickname: z.string().max(20).optional().default(''),
 });
 
 export const ageVerificationSchema = z.object({
-  age: z.number().int().min(1).max(120),
+  age: z.coerce.number().int().min(1).max(120),
 });
 
 export const displayNameSchema = z.object({
@@ -19,14 +28,14 @@ export const displayNameSchema = z.object({
 });
 
 export const avatarSchema = z.object({
-  avatarBase64: z.string().startsWith('data:image/').min(100),
+  avatarBase64: z.string().min(100),
 });
 
 export const spendCoinsSchema = z.object({
-  coins: z.number().positive().int(),
+  coins: z.coerce.number().positive().int(),
   type: z.string().optional(),
   giftType: z.string().optional(),
-  recipientId: z.number().optional(),
+  recipientId: z.union([z.string(), z.number()]).optional(),
 });
 
 export const giftSchema = z.object({
@@ -58,15 +67,15 @@ export const paymentVerifySchema = z.object({
 });
 
 export const coinCheckoutSchema = z.object({
-  coins: z.number().positive().int(),
-  price: z.number().positive(),
+  coins: z.coerce.number().positive().int(),
+  price: z.coerce.number().positive(),
 });
 
 export const agoraTokenSchema = z.object({
   channelName: z.string().min(1),
   uid: z.union([z.string(), z.number()]).optional(),
   role: z.enum(['publisher', 'subscriber']).optional().default('publisher'),
-  expirySeconds: z.number().int().positive().optional().default(3600),
+  expirySeconds: z.coerce.number().int().positive().optional().default(3600),
 });
 
 // Queue schemas (deprecated endpoints)
@@ -74,8 +83,8 @@ export const enqueueSchema = z.object({
   gender: z.enum(['male', 'female', 'any']).optional().default('any'),
   looking_for: z.enum(['male', 'female', 'any']).optional().default('any'),
   location: z.string().max(50).optional().default('any'),
-  interests: z.array(z.string().max(30)).max(5).optional().default([]),
-  nickname: z.string().min(1).max(20).optional().default(''),
+  interests: stringArray.optional().default([]),
+  nickname: z.string().max(20).optional().default(''),
 });
 
 /**
