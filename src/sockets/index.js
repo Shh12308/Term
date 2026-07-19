@@ -2,6 +2,10 @@ import { Server as SocketIOServer } from 'socket.io';
 import { env, config } from '../config/index.js';
 import { pubClient, subClient, isRedisConnected } from '../services/redisService.js';
 import { socketAuthMiddleware } from '../middleware/auth.js';
+import { query } from '../database/pool.js'; // Import at top, NOT dynamically
+import { matchService } from '../services/matchService.js'; // Import at top
+import { queueService } from '../services/queueService.js'; // Import at top
+import { cacheService } from '../services/cacheService.js';
 import logger from '../utils/logger.js';
 import { registerMatchmakingHandlers } from './matchmaking.js';
 import { registerChatHandlers } from './chat.js';
@@ -57,7 +61,6 @@ export function initSocketIO(server) {
       if (!room || !userId) return;
       
       try {
-        // Leave all current rooms first
         for (const r of getSocketRooms(socket)) {
           socket.leave(r);
           socket.to(r).emit('peer_left', { socketId: socket.id, userId });
@@ -70,8 +73,6 @@ export function initSocketIO(server) {
           username: user?.username || 'User' 
         });
         
-        // Send room history
-        const { query } = await import('../database/pool.js');
         const { rows } = await query(
           'SELECT * FROM chat_messages WHERE room_id = $1 ORDER BY created_at DESC LIMIT 50',
           [room]
@@ -88,7 +89,7 @@ export function initSocketIO(server) {
         await query(
           'INSERT INTO room_activity (user_id, room_id, action, created_at) VALUES ($1, $2, $3, NOW())',
           [userId, room, 'join']
-        );
+        ).catch(() => {});
       } catch (err) {
         logger.error({ err, userId, room, event: 'join_room_error' }, 'Failed to join room');
         socket.emit('error', { message: 'Failed to join room' });
@@ -102,11 +103,10 @@ export function initSocketIO(server) {
         socket.leave(room);
         socket.to(room).emit('peer_left', { socketId: socket.id, userId });
         
-        const { query } = await import('../database/pool.js');
         await query(
           'INSERT INTO room_activity (user_id, room_id, action, created_at) VALUES ($1, $2, $3, NOW())',
           [userId, room, 'leave']
-        );
+        ).catch(() => {});
       } catch (err) {
         logger.error({ err, userId, room, event: 'leave_room_error' }, 'Failed to leave room');
       }
@@ -138,10 +138,7 @@ export function initSocketIO(server) {
       }
 
       try {
-        const { query } = await import('../database/pool.js');
-        const { cacheService } = await import('../services/cacheService.js');
-        
-        await query('UPDATE users SET username = $1, updated_at = NOW() WHERE id = $2', [name, userId]);
+        await query('UPDATE users SET username = $1, updated_at = NOW() WHERE id = $2', [name, userId]).catch(() => {});
         const updatedUser = { ...user, username: name };
         await cacheService.set(`user:${userId}`, updatedUser);
         socket.data.user = updatedUser;
@@ -152,25 +149,23 @@ export function initSocketIO(server) {
       }
     });
 
-    // Disconnect handler
+    // Disconnect handler - NO dynamic imports
     socket.on('disconnect', async (reason) => {
       logger.info({ userId, socketId: socket.id, reason, event: 'socket_disconnected' }, 'User disconnected');
       
+      setOffline(userId);
+      
+      // Wrap all cleanup in a single try-catch to prevent unhandled rejections
       try {
-        setOffline(userId);
-        
-        const { query } = await import('../database/pool.js');
-        const { matchService, queueService } = await import('../services/index.js');
-        
-        await matchService.endMatch(userId);
-        await queueService.remove(userId);
+        await matchService.endMatch(userId).catch(() => {});
+        await queueService.remove(userId).catch(() => {});
         socket.data.inQueue = false;
 
         for (const room of getSocketRooms(socket)) {
           socket.to(room).emit('peer_left', { socketId: socket.id, userId });
         }
       } catch (err) {
-        logger.error({ err, userId, event: 'disconnect_error' }, 'Disconnect cleanup failed');
+        // Silently ignore disconnect errors - user is already gone
       }
     });
   });
@@ -195,7 +190,6 @@ export async function getOnlineSocketId(userId) {
   const local = onlineSockets.get(String(userId));
   if (local) return local;
   
-  // Try Redis if available
   const { redis } = await import('../services/redisService.js');
   const cached = await redis.get(`socket:online:${userId}`);
   return cached || null;
