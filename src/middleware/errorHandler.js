@@ -1,12 +1,12 @@
 import { ApiError } from '../utils/errors.js';
 import logger from '../utils/logger.js';
 import { env } from '../config/index.js';
+import z from 'zod';
 
 /**
  * Global error handler middleware
  */
 export function errorHandler(err, req, res, next) {
-  // Log the error
   const errorInfo = {
     err,
     event: 'request_error',
@@ -17,7 +17,6 @@ export function errorHandler(err, req, res, next) {
   };
 
   if (err instanceof ApiError) {
-    // Operational error - log at appropriate level
     if (err.statusCode >= 500) {
       logger.error(errorInfo, err.message);
     } else {
@@ -27,7 +26,8 @@ export function errorHandler(err, req, res, next) {
     return res.status(err.statusCode).json({
       error: err.message,
       code: err.code,
-      details: env.NODE_ENV === 'development' ? err.details : undefined,
+      // ALWAYS show validation details so frontend can fix the request
+      details: err.details || undefined,
     });
   }
 
@@ -64,6 +64,3 @@ export function notFoundHandler(req, res) {
     path: req.path,
   });
 }
-
-// Import zod for ZodError check
-import z from 'zod';
