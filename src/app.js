@@ -13,7 +13,7 @@ import userRoutes from './routes/users.js';
 import adminRoutes from './routes/admin.js';
 import paymentRoutes from './routes/payments.js';
 import queueRoutes from './routes/queue.js';
-import matchService from './services/matchService.js';
+import { matchService } from './services/matchService.js';
 
 const app = express();
 
