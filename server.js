@@ -795,7 +795,7 @@ io.on("connection", (socket) => {
       interests = interests.filter(i => typeof i === "string" && i.length > 0 && i.length <= 30);
 
       let location = data.location || user.location || "any";
-      if (!location || location === "any") {
+      if (!location || location === "any" || location === "nearby") {
         const ip = socket.handshake.headers["x-forwarded-for"]?.split(",")[0] || socket.handshake.address;
         const geo = geoip.lookup(ip);
         location = geo?.country?.toLowerCase() || "any";
@@ -1210,7 +1210,7 @@ app.post("/api/user/preferences", requireAuth, async (req, res) => {
     if (!Array.isArray(interests) || interests.length > MAX_INTERESTS) return res.status(400).json({ error: `You can have up to ${MAX_INTERESTS} interests` });
     interests = interests.filter((interest) => typeof interest === "string" && interest.length > 0 && interest.length <= 30);
     const userId = String(req.user.id);
-    if (!location || location === "any") { const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress; const geo = geoip.lookup(ip); location = geo?.country?.toLowerCase() || "any"; }
+    if (!location || location === "any" || location === "nearby") { const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress; const geo = geoip.lookup(ip); location = geo?.country?.toLowerCase() || "any"; }
     if (req.user.banned_until && new Date(req.user.banned_until) > new Date()) return res.status(403).json({ error: "Account banned" });
     await pool.query(`UPDATE users SET gender=$1, looking_for=$2, location=$3, interests=$4, nickname=$5, updated_at=NOW() WHERE id=$6`, [gender || "any", looking_for || "any", location || "any", interests, nickname || "", userId]);
     const updatedUser = { ...req.user, gender, looking_for, location, interests, nickname };
@@ -1239,7 +1239,7 @@ app.post("/queue/enqueue", requireAuth, async (req, res) => {
     const userId = String(req.user.id);
     const { rows: activeMatch } = await pool.query("SELECT * FROM matches WHERE (user_a=$1 OR user_b=$1) AND ended_at IS NULL", [userId]);
     if (activeMatch.length > 0) return res.status(400).json({ error: "You're already in a match" });
-    if (!location || location === "any") { const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress; const geo = geoip.lookup(ip); location = geo?.country?.toLowerCase() || "any"; }
+    if (!location || location === "any" || location === "nearby") { const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress; const geo = geoip.lookup(ip); location = geo?.country?.toLowerCase() || "any"; }
     if (req.user.banned_until && new Date(req.user.banned_until) > new Date()) return res.status(403).json({ error: "Account banned" });
     if (!req.user.age_verified) return res.status(403).json({ error: "Age verification required for video features" });
     if (nickname && (nickname.length > MAX_NICKNAME_LENGTH || nickname.length < 1)) return res.status(400).json({ error: `Nickname must be between 1 and ${MAX_NICKNAME_LENGTH} characters` });
