@@ -87,7 +87,12 @@ const pool = new pg.Pool({
   connectionTimeoutMillis: 5000,
 });
 
-const JWT_SECRET = process.env.JWT_SECRET || "super_secret_jwt_key";
+// CRITICAL FIX 1: Enforce JWT Secret
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error("FATAL ERROR: JWT_SECRET is not defined in environment variables.");
+  process.exit(1);
+}
 
 // Check if OpenAI key is valid to prevent 401 errors
 const IS_MODERATION_ENABLED = process.env.OPENAI_API_KEY && 
@@ -934,7 +939,7 @@ io.on("connection", (socket) => {
 
       if (IS_MODERATION_ENABLED) {
         const mod = await OPENAI.moderations.create({ model: "omni-moderation-latest", input: text });
-        const flagged = mod.results?.[0]?.categories?.sexual || mod.results?.[0]?.categories?.hate || mod.results?.[0]?.categories?.violence || mod.results?.[0]?.flagged;
+        const flagged = mod.results?.[0]?.flagged; // Fix: Only rely on the main flagged boolean to prevent false positives
 
         if (flagged) {
           const banReason = `Inappropriate message: ${JSON.stringify(mod.results[0].category_scores)}`;
@@ -982,7 +987,8 @@ io.on("connection", (socket) => {
   socket.on("video_frame", async ({ frameBase64, roomId }) => {
     if (!userId) return;
     const now = Date.now();
-    if (now - socket.data.lastFrameModeration < 1000) return;
+    // FIX 8: Throttle to 5 seconds to save CPU/API Costs
+    if (now - socket.data.lastFrameModeration < 5000) return;
     socket.data.lastFrameModeration = now;
 
     try {
@@ -1002,7 +1008,9 @@ io.on("connection", (socket) => {
       if (IS_MODERATION_ENABLED) {
         const mod = await OPENAI.moderations.create({ model: "omni-moderation-latest", input: processedBase64 });
         const result = mod.results?.[0];
-        const flagged = result?.flagged || result?.categories?.sexual || result?.categories?.violence || result?.categories?.hate;
+        
+        // FIX: Rely only on the top-level flagged boolean rather than individual truthy categories to prevent false positives
+        const flagged = result?.flagged;
 
         if (flagged) {
           const banReason = `Inappropriate content detected`;
@@ -1141,10 +1149,19 @@ app.post("/api/create-checkout-session", requireAuth, async (req, res) => {
   } catch (error) { console.error("Error creating checkout session:", error); res.status(500).json({ error: "Failed to create payment session" }); }
 });
 
+// FIX 4: Prevent Stripe Replay Attacks
 app.post("/api/verify-payment", requireAuth, async (req, res) => {
   try {
     if (!stripe) return res.status(503).json({ error: "Payment system unavailable" });
     const { sessionId } = req.body;
+    
+    // 1. Check if this session was already processed
+    const { rows: existing } = await pool.query("SELECT coins FROM coin_transactions WHERE transaction_id = $1", [sessionId]);
+    if (existing.length > 0) {
+      const { rows: userRows } = await pool.query("SELECT coins FROM users WHERE id = $1", [req.user.id]);
+      return res.json({ success: true, coins: userRows[0].coins, message: "Payment already processed" });
+    }
+
     const session = await stripe.checkout.sessions.retrieve(sessionId);
     if (session.payment_status === "paid") {
       const coins = parseInt(session.metadata.coins);
@@ -1176,6 +1193,7 @@ async function ensureColumns() {
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS interests TEXT[] DEFAULT '{}'`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS gender VARCHAR(20) DEFAULT 'any'`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS location VARCHAR(50) DEFAULT 'any'`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS dob DATE`);
     
     // CRITICAL: Ensure queue table has columns for new matching logic
     await pool.query(`ALTER TABLE queue ADD COLUMN IF NOT EXISTS looking_for VARCHAR(20) DEFAULT 'any'`);
@@ -1219,16 +1237,32 @@ app.post("/api/user/preferences", requireAuth, async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: "Could not save preferences" }); }
 });
 
+// FIX 6: Real Age Verification (Server-side calculation)
 app.post("/api/user/verify-age", requireAuth, async (req, res) => {
   try {
-    const { age } = req.body;
-    if (!age || isNaN(age)) return res.status(400).json({ error: "Valid age required" });
-    if (age < MIN_AGE_FOR_VIDEO) return res.status(400).json({ error: `You must be at least ${MIN_AGE_FOR_VIDEO} to use video features` });
-    await pool.query("UPDATE users SET age_verified=$1, updated_at=NOW() WHERE id=$2", [true, req.user.id]);
+    const { day, month, year } = req.body;
+    if (!day || !month || !year) return res.status(400).json({ error: "Valid date of birth required" });
+
+    const birthDate = new Date(year, month - 1, day);
+    const today = new Date();
+    let age = today.getFullYear() - birthDate.getFullYear();
+    const m = today.getMonth() - birthDate.getMonth();
+    if (m < 0 || (m === 0 && today.getDate() < birthDate.getDate())) age--;
+
+    if (isNaN(age) || age < MIN_AGE_FOR_VIDEO) {
+      return res.status(400).json({ error: `You must be at least ${MIN_AGE_FOR_VIDEO} to use video features` });
+    }
+
+    // Store DOB in DB to prevent future changes
+    await pool.query("UPDATE users SET age_verified=$1, dob=$2, updated_at=NOW() WHERE id=$3 AND age_verified IS FALSE", [true, birthDate, req.user.id]);
+    
     const updatedUser = { ...req.user, age_verified: true };
     userCache.set(`user:${req.user.id}`, updatedUser);
     res.json({ ok: true });
-  } catch (err) { console.error("Age verification failed:", err); res.status(500).json({ error: "Could not verify age" }); }
+  } catch (err) { 
+    console.error("Age verification failed:", err); 
+    res.status(500).json({ error: "Could not verify age" }); 
+  }
 });
 
 app.post("/queue/enqueue", requireAuth, async (req, res) => {
@@ -1307,9 +1341,12 @@ app.post("/queue/leave", requireAuth, async (req, res) => {
 const { RtcTokenBuilder, RtcRole, RtmTokenBuilder } = agora;
 app.post("/generateToken", requireAuth, async (req, res) => {
   try {
-    const { channelName, uid: requestedUid, role = "publisher", expirySeconds = 3600 } = req.body;
+    const { channelName, role = "publisher", expirySeconds = 3600 } = req.body;
     if (!channelName) return res.status(400).json({ error: "channelName required" });
-    const uid = requestedUid !== undefined ? String(requestedUid) : String(req.user.id);
+    
+    // FIX 5: Remove client UID spoofing. Force UID to be the authenticated user's ID.
+    const uid = String(req.user.id); 
+    
     const rtcRole = role === "publisher" ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER;
     const currentTimestamp = Math.floor(Date.now() / 1000);
     const privilegeExpiredTs = currentTimestamp + Number(expirySeconds);
@@ -1373,18 +1410,26 @@ app.post("/api/user/avatar", requireAuth, async (req, res) => {
   } catch (err) { console.error("Avatar upload failed:", err); res.status(500).json({ error: "Could not upload avatar" }); }
 });
 
-app.post("/api/pay-unban", async (req, res) => {
+// FIX 2: Require Auth for Unban Payment
+app.post("/api/pay-unban", requireAuth, async (req, res) => {
   try {
     if (!ChargeResource) return res.status(503).json({ error: "Payment system unavailable" });
-    const { userId } = req.body;
+    
+    // Use authenticated user's ID instead of trusting the request body
+    const userId = req.user.id;
+    
     const { rows } = await pool.query("SELECT * FROM users WHERE id=$1 AND banned_until > NOW()", [userId]);
     if (!rows.length) return res.status(400).json({ error: "User not found or not banned" });
     const chargeData = { name: "Ban Removal", description: "Remove your account suspension", local_price: { amount: UNBAN_PRICE.toFixed(2), currency: "USD" }, pricing_type: "fixed_price", metadata: { userId: String(userId) }, redirect_url: `${process.env.FRONTEND_URL}?unban=success`, cancel_url: `${process.env.FRONTEND_URL}` };
     const charge = await ChargeResource.create(chargeData);
     res.json({ url: charge.hosted_url });
-  } catch (err) { console.error(err); res.status(500).json({ error: "Coinbase payment creation failed" }); }
+  } catch (err) { 
+    console.error(err); 
+    res.status(500).json({ error: "Coinbase payment creation failed" }); 
+  }
 });
 
+// FIX 3: Atomic Coin Spending & Prevent Race Conditions
 app.post("/api/create-gift-checkout", requireAuth, async (req, res) => {
   try {
     const { giftType, recipientId } = req.body;
@@ -1398,18 +1443,23 @@ app.post("/api/create-gift-checkout", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Recipient ID required" });
     }
 
-    if (req.user.coins < cost) {
+    // 1. Attempt to deduct coins atomically
+    const { rows } = await pool.query(
+      "UPDATE users SET coins = coins - $1, updated_at = NOW() WHERE id = $2 AND coins >= $1 RETURNING coins",
+      [cost, req.user.id]
+    );
+
+    // 2. If no rows returned, they didn't have enough coins
+    if (rows.length === 0) {
       return res.status(400).json({ 
         error: "Insufficient coins. Please purchase more coins.", 
         code: "INSUFFICIENT_FUNDS" 
       });
     }
 
-    await pool.query(
-      "UPDATE users SET coins = coins - $1, updated_at = NOW() WHERE id = $2",
-      [cost, req.user.id]
-    );
+    const newBalance = rows[0].coins;
 
+    // 3. Record the transaction
     await pool.query(
       "INSERT INTO coin_transactions (user_id, coins, amount, transaction_type, gift_type, recipient_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, NOW())",
       [req.user.id, -cost, 0, "gift_sent", giftType, String(recipientId)]
@@ -1417,6 +1467,7 @@ app.post("/api/create-gift-checkout", requireAuth, async (req, res) => {
 
     userCache.del(`user:${req.user.id}`);
 
+    // 4. Notify recipient
     const recipientSocketId = await getUserSocketId(String(recipientId));
     if (recipientSocketId) {
       io.to(recipientSocketId).emit("gift_received", {
@@ -1426,7 +1477,7 @@ app.post("/api/create-gift-checkout", requireAuth, async (req, res) => {
       });
     }
 
-    res.json({ success: true, newBalance: req.user.coins - cost });
+    res.json({ success: true, newBalance });
   } catch (error) {
     console.error("Error sending gift:", error);
     res.status(500).json({ error: "Failed to send gift" });
@@ -1590,6 +1641,7 @@ app.get("/health", (req, res) => {
   });
 });
 
+// FIX 7: Replace redis.keys() with redis.scan() to prevent blocking
 cron.schedule("*/5 * * * *", async () => {
   try {
     const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
@@ -1608,17 +1660,23 @@ cron.schedule("*/5 * * * *", async () => {
     }
     
     if (useRedisForMatching && redisClient) {
-      const staleKeys = await redisClient.keys("matchq:*");
-      for (const key of staleKeys) {
-        const userId = key.replace("matchq:", "");
-        const ts = await redisClient.hGet(key, "ts");
-        if (ts && parseInt(ts) < fiveMinutesAgo) {
-          const socketId = await getUserSocketId(userId);
-          if (!socketId) {
-            await redisQueueRemove(userId);
+      let cursor = '0';
+      do {
+        const reply = await redisClient.scan(cursor, { MATCH: 'matchq:*', COUNT: 100 });
+        cursor = reply.cursor;
+        const keys = reply.keys;
+        
+        for (const key of keys) {
+          const userId = key.replace("matchq:", "");
+          const ts = await redisClient.hGet(key, "ts");
+          if (ts && parseInt(ts) < fiveMinutesAgo) {
+            const socketId = await getUserSocketId(userId);
+            if (!socketId) {
+              await redisQueueRemove(userId);
+            }
           }
         }
-      }
+      } while (cursor !== '0');
     }
   } catch (err) {
     console.error("Queue cleanup error:", err.message);
